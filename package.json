@@ -1,10 +1,10 @@
 {
   "name": "hearth-dash",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Personal dashboard — moods, moments, food diary, weather, and more. Deploy to Cloudflare in one command.",
   "type": "module",
   "bin": {
-    "hearth-dash": "./cli/index.js"
+    "hearth-dash": "cli/index.js"
   },
   "scripts": {
     "dev": "npx wrangler dev",
@@ -25,7 +25,7 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/martusha89/hearth-dash.git"
+    "url": "git+https://github.com/martusha89/hearth-dash.git"
   },
   "engines": {
     "node": ">=18"
