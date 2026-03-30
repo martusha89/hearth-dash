@@ -1,0 +1,23 @@
+name = "hearth-dash"
+main = "worker.js"
+compatibility_date = "2024-12-01"
+
+[vars]
+PARTNER_1 = "Partner 1"
+PARTNER_2 = "Partner 2"
+# WEATHER_LAT = "52.5726"
+# WEATHER_LON = "-0.2405"
+
+# Secrets (set via: npx wrangler secret put <NAME>)
+# DASHBOARD_PASSWORD — or set it via the web UI on first visit
+# MCP_SECRET
+# WEATHER_API_KEY
+
+[[d1_databases]]
+binding = "DB"
+database_name = "hearth-dash-db"
+database_id = "YOUR_D1_DATABASE_ID"
+
+[[r2_buckets]]
+binding = "PHOTOS"
+bucket_name = "hearth-dash-photos"
