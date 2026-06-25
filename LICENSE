@@ -1,16 +1,27 @@
-MIT License
+Non-Commercial License
 
-Copyright (c) 2026 AIDHD
+Copyright (c) 2026 Marta Varen
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
+of this software and associated documentation files (the "Software"), to use,
+copy, modify, merge, and distribute the Software, subject to the following
+conditions:
 
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
+1. NON-COMMERCIAL USE ONLY. The Software may not be sold, sublicensed, or
+   included in any product or service that is sold, offered for a fee, or
+   otherwise commercialized. This includes but is not limited to: selling
+   the Software, offering it as a paid service, bundling it with paid
+   products, or using it as a component of a commercial offering.
+
+2. ATTRIBUTION. The above copyright notice and this permission notice shall
+   be included in all copies or substantial portions of the Software.
+
+3. SHARE-ALIKE. If you modify and distribute the Software, you must
+   distribute your modifications under this same license.
+
+4. PERSONAL AND EDUCATIONAL USE. Use of the Software for personal projects,
+   education, research, and non-commercial open source projects is
+   explicitly permitted and encouraged.
 
 THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
 IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,

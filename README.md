@@ -4,7 +4,7 @@
 
 [![Cloudflare Workers](https://img.shields.io/badge/Cloudflare%20Workers-F38020?style=for-the-badge&logo=cloudflare&logoColor=white)](#)
 [![D1](https://img.shields.io/badge/D1-SQLite-22D3EE?style=for-the-badge&logo=cloudflare&logoColor=white)](#)
-[![license MIT](https://img.shields.io/badge/license-MIT-A855F7?style=for-the-badge)](LICENSE)
+[![license Non-Commercial](https://img.shields.io/badge/license-Non--Commercial-A855F7?style=for-the-badge)](LICENSE)
 
 </div>
 
@@ -67,4 +67,4 @@ Cloudflare Workers (single-file `worker.js`), D1 (SQLite), R2 for photo storage,
 
 ## License
 
-MIT. See [LICENSE](LICENSE).
+Non-Commercial. Free for personal, educational, and non-commercial use. See [LICENSE](LICENSE).
