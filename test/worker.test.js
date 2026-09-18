@@ -167,7 +167,7 @@ test('issues a signed secure session rather than storing the password in the coo
   assert.ok(!cookie.includes(testEnv.DASHBOARD_PASSWORD));
 });
 
-test('accepts a same-origin browser login when a trusted wrapper rewrites request.url', async () => {
+test('rejects contradictory non-null Origin even with same-origin Fetch Metadata', async () => {
   const testEnv = env();
   const form = new FormData();
   form.set('password', testEnv.DASHBOARD_PASSWORD);
@@ -180,8 +180,54 @@ test('accepts a same-origin browser login when a trusted wrapper rewrites reques
     },
     body: form,
   }), testEnv);
+  assert.equal(response.status, 403);
+});
+
+test('accepts Chrome same-origin login when Origin is serialized as null', async () => {
+  const testEnv = env();
+  const form = new FormData();
+  form.set('password', testEnv.DASHBOARD_PASSWORD);
+  const response = await applicationHandler.fetch(new Request('https://hearth-dash.vixen1590.workers.dev/login', {
+    method: 'POST',
+    headers: {
+      Origin: 'null',
+      'Sec-Fetch-Site': 'same-origin',
+    },
+    body: form,
+  }), testEnv);
   assert.equal(response.status, 302);
   assert.match(response.headers.get('Set-Cookie'), /__Host-hearth_session=/);
+});
+
+test('applies a strict Fetch Metadata and Origin decision table', async () => {
+  const cases = [
+    { fetchSite: 'same-origin', origin: 'https://hearth.example', expected: 302 },
+    { fetchSite: 'same-origin', origin: 'null', expected: 302 },
+    { fetchSite: 'same-origin', origin: null, expected: 302 },
+    { fetchSite: 'same-origin', origin: 'https://evil.example', expected: 403 },
+    { fetchSite: 'same-origin', origin: 'not a URL', expected: 403 },
+    { fetchSite: 'same-origin', origin: 'https://hearth.example, https://evil.example', expected: 403 },
+    { fetchSite: 'same-site', origin: 'https://hearth.example', expected: 403 },
+    { fetchSite: 'cross-site', origin: 'https://hearth.example', expected: 403 },
+    { fetchSite: 'none', origin: null, expected: 403 },
+    { fetchSite: null, origin: 'https://hearth.example', expected: 302 },
+    { fetchSite: null, origin: 'null', expected: 403 },
+    { fetchSite: null, origin: null, expected: 403 },
+    { fetchSite: 'future-value', origin: 'https://hearth.example', expected: 302 },
+    { fetchSite: 'future-value', origin: null, expected: 403 },
+  ];
+
+  for (const item of cases) {
+    const headers = {};
+    if (item.fetchSite !== null) headers['Sec-Fetch-Site'] = item.fetchSite;
+    if (item.origin !== null) headers.Origin = item.origin;
+    const form = new FormData();
+    form.set('password', env().DASHBOARD_PASSWORD);
+    const response = await applicationHandler.fetch(new Request('https://hearth.example/login', {
+      method: 'POST', headers, body: form,
+    }), env());
+    assert.equal(response.status, item.expected, JSON.stringify(item));
+  }
 });
 
 test('still rejects cross-site dashboard posts', async () => {

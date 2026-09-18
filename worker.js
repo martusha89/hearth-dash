@@ -85,18 +85,38 @@ function sessionCookie(value, maxAge = 604800) {
 }
 
 export function sameOrigin(request) {
-  const origin = request.headers.get('Origin');
-  if (!origin) return true;
-  let parsedOrigin;
-  try { parsedOrigin = new URL(origin); } catch { return false; }
-  if (parsedOrigin.origin === new URL(request.url).origin) return true;
+  const targetOrigin = new URL(request.url).origin;
+  const fetchSite = request.headers.get('Sec-Fetch-Site');
+  const suppliedOrigin = classifyOrigin(request.headers.get('Origin'));
 
-  // Host and Fetch Metadata describe the browser-facing request even if a
-  // trusted Worker wrapper has reconstructed request.url with an internal
-  // origin. Browsers do not let cross-origin pages forge either value.
-  const host = request.headers.get('Host');
-  if (host && parsedOrigin.host === host) return true;
-  return request.headers.get('Sec-Fetch-Site') === 'same-origin';
+  // Fetch Metadata is browser-controlled and cannot be forged by hostile page
+  // JavaScript. Chrome can legitimately serialize Origin as "null" here, so a
+  // same-origin classification is the decisive signal for null/missing Origin.
+  if (fetchSite === 'same-origin') {
+    if (suppliedOrigin.kind === 'missing' || suppliedOrigin.kind === 'null') return true;
+    return suppliedOrigin.kind === 'origin' && suppliedOrigin.value === targetOrigin;
+  }
+
+  // Reject explicit cross-origin classifications even if another header is
+  // malformed or contradictory. "same-site" can still be another subdomain.
+  if (fetchSite === 'cross-site' || fetchSite === 'same-site' || fetchSite === 'none') return false;
+
+  // Older/non-browser clients without Fetch Metadata must provide one exact,
+  // valid HTTP(S) Origin. Unknown future Fetch Metadata values use this same
+  // conservative fallback.
+  return suppliedOrigin.kind === 'origin' && suppliedOrigin.value === targetOrigin;
+}
+
+function classifyOrigin(value) {
+  if (value === null) return { kind: 'missing' };
+  if (value === 'null') return { kind: 'null' };
+  try {
+    const parsed = new URL(value);
+    if (!['http:', 'https:'].includes(parsed.protocol) || parsed.origin !== value) return { kind: 'invalid' };
+    return { kind: 'origin', value: parsed.origin };
+  } catch {
+    return { kind: 'invalid' };
+  }
 }
 
 export function isOAuthRoute(pathname) {

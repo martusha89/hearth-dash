@@ -116,6 +116,10 @@ The first-visit password setup page has also been removed. A public, unclaimed s
 
 Version 1.1.1 keeps ordinary dashboard, login and API requests outside the OAuth provider and makes same-origin form validation resilient when a trusted Cloudflare wrapper reconstructs the internal request URL. Cross-site browser submissions remain rejected. Upgrade with `npx hearth-dash@latest deploy` if a 1.1.0 deployment returns plain `Forbidden` after submitting `/login`.
 
+### 1.1.2 Chrome null-Origin fix
+
+Version 1.1.2 accepts Chrome's legitimate `Origin: null` on a form submission only when the browser's unforgeable Fetch Metadata independently classifies the request as `same-origin`. Mismatched, malformed, same-site and cross-site requests remain rejected.
+
 ## Security notes
 
 - There are no functional default credentials, bearer tokens or secret-bearing connector URLs.
