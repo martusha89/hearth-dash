@@ -1,6 +1,7 @@
 name = "hearth-dash"
-main = "worker.js"
+main = "oauth-entry.js"
 compatibility_date = "2024-12-01"
+compatibility_flags = ["global_fetch_strictly_public"]
 
 [vars]
 PARTNER_1 = "Partner 1"
@@ -9,9 +10,13 @@ PARTNER_2 = "Partner 2"
 # WEATHER_LON = "-0.2405"
 
 # Secrets (set via: npx wrangler secret put <NAME>)
-# DASHBOARD_PASSWORD — or set it via the web UI on first visit
-# MCP_SECRET
+# DASHBOARD_PASSWORD
+# SESSION_SECRET
 # WEATHER_API_KEY
+
+[[kv_namespaces]]
+binding = "OAUTH_KV"
+id = "YOUR_OAUTH_KV_ID"
 
 [[d1_databases]]
 binding = "DB"

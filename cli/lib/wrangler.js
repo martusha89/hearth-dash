@@ -24,6 +24,19 @@ export function execWrangler(args, cwd, stdinData) {
   });
 }
 
+export function execCommand(command, args, cwd) {
+  return new Promise((resolve) => {
+    const proc = spawnCmd(command, args, {
+      cwd, stdio: ['ignore', 'pipe', 'pipe'],
+      env: { ...process.env, FORCE_COLOR: '0' },
+    });
+    let stdout = '', stderr = '';
+    proc.stdout.on('data', (data) => { stdout += data.toString(); });
+    proc.stderr.on('data', (data) => { stderr += data.toString(); });
+    proc.on('close', (code) => resolve({ stdout: stdout.trim(), stderr: stderr.trim(), code }));
+  });
+}
+
 export function parseD1CreateOutput(output) {
   const combined = output.stdout + "\n" + output.stderr;
   const match = combined.match(/database_id\s*=\s*"([^"]+)"/);
@@ -70,4 +83,18 @@ export async function listD1Databases(cwd) {
   const result = await execWrangler(["d1", "list", "--json"], cwd);
   if (result.code !== 0) return [];
   try { return JSON.parse(result.stdout); } catch { return []; }
+}
+
+export async function listKvNamespaces(cwd) {
+  const result = await execWrangler(['kv', 'namespace', 'list'], cwd);
+  if (result.code !== 0) return [];
+  try { return JSON.parse(result.stdout); } catch { return []; }
+}
+
+export function parseKvCreateOutput(output) {
+  const combined = output.stdout + '\n' + output.stderr;
+  const toml = combined.match(/id\s*=\s*"([a-f0-9]{32})"/i);
+  if (toml) return toml[1];
+  const json = combined.match(/"id"\s*:\s*"([a-f0-9]{32})"/i);
+  return json ? json[1] : null;
 }

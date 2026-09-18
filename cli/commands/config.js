@@ -20,7 +20,7 @@ export default async function configCommand(args) {
   console.log(`  ${bold("Partner 1:")}      ${config.partner1 || "not set"}`);
   console.log(`  ${bold("Partner 2:")}      ${config.partner2 || "not set"}`);
   console.log(`  ${bold("Database ID:")}    ${config.dbId ? config.dbId.substring(0, 8) + "..." : "not set"}`);
-  console.log(`  ${bold("MCP Secret:")}     ${config.mcpSecret ? config.mcpSecret.substring(0, 6) + "..." : "not set"}`);
+  console.log(`  ${bold("MCP Auth:")}       OAuth 2.1`);
   console.log(`  ${bold("Deployed:")}       ${config.deployedAt || "never"}`);
   console.log(`\n  ${dim("Config file: " + CONFIG_PATH)}\n`);
 }

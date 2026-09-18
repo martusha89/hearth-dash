@@ -6,21 +6,106 @@
  * Docs: https://github.com/martusha89/hearth-dash
  */
 
-async function getConfig(env) {
-  let password = env.DASHBOARD_PASSWORD || null;
-  // If no env var password, check D1 for one set via the setup page
-  if (!password) {
-    try {
-      const row = await env.DB.prepare("SELECT value FROM config WHERE key = 'password'").first();
-      if (row) password = row.value;
-    } catch(e) {}
-  }
+const encoder = new TextEncoder();
+const MCP_PROTOCOL_VERSIONS = ['2025-06-18', '2025-03-26'];
+const MAX_JSON_BODY_BYTES = 64 * 1024;
+
+function getConfig(env) {
   return {
-    PASSWORD: password,
-    MCP_SECRET: env.MCP_SECRET || 'change-me-too',
+    PASSWORD: env.DASHBOARD_PASSWORD || null,
+    SESSION_SECRET: env.SESSION_SECRET || null,
+    MCP_ALLOWED_ORIGINS: (env.MCP_ALLOWED_ORIGINS || 'https://claude.ai')
+      .split(',').map(value => value.trim()).filter(Boolean),
     PARTNER_1: env.PARTNER_1 || 'Partner 1',
     PARTNER_2: env.PARTNER_2 || 'Partner 2',
   };
+}
+
+function base64Url(bytes) {
+  let binary = '';
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
+}
+
+function fromBase64Url(value) {
+  const padded = value.replace(/-/g, '+').replace(/_/g, '/') + '='.repeat((4 - value.length % 4) % 4);
+  const binary = atob(padded);
+  return Uint8Array.from(binary, char => char.charCodeAt(0));
+}
+
+async function hmac(secret, value) {
+  const key = await crypto.subtle.importKey('raw', encoder.encode(secret), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+  return new Uint8Array(await crypto.subtle.sign('HMAC', key, encoder.encode(value)));
+}
+
+async function safeEqual(left, right) {
+  const leftDigest = new Uint8Array(await crypto.subtle.digest('SHA-256', encoder.encode(String(left || ''))));
+  const rightDigest = new Uint8Array(await crypto.subtle.digest('SHA-256', encoder.encode(String(right || ''))));
+  let mismatch = 0;
+  for (let i = 0; i < leftDigest.length; i++) mismatch |= leftDigest[i] ^ rightDigest[i];
+  return mismatch === 0;
+}
+
+async function createSession(secret) {
+  const payload = base64Url(encoder.encode(JSON.stringify({
+    exp: Math.floor(Date.now() / 1000) + 7 * 24 * 60 * 60,
+    nonce: crypto.randomUUID(),
+  })));
+  return payload + '.' + base64Url(await hmac(secret, payload));
+}
+
+async function verifySession(token, secret) {
+  if (!token || !secret) return false;
+  const parts = token.split('.');
+  if (parts.length !== 2) return false;
+  try {
+    const expected = base64Url(await hmac(secret, parts[0]));
+    if (!(await safeEqual(parts[1], expected))) return false;
+    const payload = JSON.parse(new TextDecoder().decode(fromBase64Url(parts[0])));
+    return Number.isFinite(payload.exp) && payload.exp > Math.floor(Date.now() / 1000);
+  } catch {
+    return false;
+  }
+}
+
+function securityHeaders(extra = {}) {
+  return {
+    'Content-Security-Policy': "default-src 'self'; img-src 'self' data: https://openweathermap.org; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'",
+    'Referrer-Policy': 'no-referrer',
+    'Strict-Transport-Security': 'max-age=31536000; includeSubDomains',
+    'X-Content-Type-Options': 'nosniff',
+    'X-Frame-Options': 'DENY',
+    'Permissions-Policy': 'camera=(), microphone=(), geolocation=()',
+    ...extra,
+  };
+}
+
+function sessionCookie(value, maxAge = 604800) {
+  return `__Host-hearth_session=${value}; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=${maxAge}`;
+}
+
+function sameOrigin(request) {
+  const origin = request.headers.get('Origin');
+  return !origin || origin === new URL(request.url).origin;
+}
+
+export async function withinRateLimit(env, request, scope, limit, windowSeconds) {
+  const address = request.headers.get('CF-Connecting-IP') || 'unknown';
+  const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', encoder.encode(address)));
+  const windowStart = Math.floor(Date.now() / 1000 / windowSeconds) * windowSeconds;
+  const key = `${scope}:${windowStart}:${base64Url(digest).slice(0, 24)}`;
+  try {
+    await env.DB.prepare(
+      'INSERT INTO rate_limits (bucket_key, count, expires_at) VALUES (?, 1, ?) ON CONFLICT(bucket_key) DO UPDATE SET count = count + 1'
+    ).bind(key, windowStart + windowSeconds * 2).run();
+    const row = await env.DB.prepare('SELECT count FROM rate_limits WHERE bucket_key = ?').bind(key).first();
+    if (Math.random() < 0.01) env.DB.prepare("DELETE FROM rate_limits WHERE expires_at < unixepoch('now')").run().catch(() => {});
+    return !row || row.count <= limit;
+  } catch {
+    // Authentication and authorization endpoints must not silently lose their
+    // abuse controls when D1 or the additive migration is unavailable.
+    return false;
+  }
 }
 
 function getSetupPage(error) {
@@ -94,9 +179,19 @@ function getLoginPage(config) {
 </html>`;
 }
 
+function escapeHtml(value) {
+  return String(value).replace(/[&<>"']/g, char => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[char]);
+}
+
+function jsonForInlineScript(value) {
+  return JSON.stringify(value).replace(/</g, '\\u003c').replace(/>/g, '\\u003e').replace(/&/g, '\\u0026');
+}
+
 function getDashboardHTML(config) {
   const P1 = config.PARTNER_1;
   const P2 = config.PARTNER_2;
+  const P1HTML = escapeHtml(P1);
+  const P2HTML = escapeHtml(P2);
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -251,7 +346,7 @@ function getDashboardHTML(config) {
     <!-- DASHBOARD TAB -->
     <div id="dashboard" class="tab-content active">
       <div class="grid">
-        <div class="card"><h2>Current Moods</h2><div class="mood-display" id="mood-display"><div class="mood-person"><h3>${P1}</h3><div class="mood-value" id="p1-mood">&mdash;</div><div class="mood-time" id="p1-mood-time"></div></div><div class="mood-person"><h3>${P2}</h3><div class="mood-value" id="p2-mood">&mdash;</div><div class="mood-time" id="p2-mood-time"></div></div></div></div>
+        <div class="card"><h2>Current Moods</h2><div class="mood-display" id="mood-display"><div class="mood-person"><h3>${P1HTML}</h3><div class="mood-value" id="p1-mood">&mdash;</div><div class="mood-time" id="p1-mood-time"></div></div><div class="mood-person"><h3>${P2HTML}</h3><div class="mood-value" id="p2-mood">&mdash;</div><div class="mood-time" id="p2-mood-time"></div></div></div></div>
         <div class="card"><h2>Latest Note</h2><div id="latest-note"><p class="empty">No notes yet</p></div></div>
         <div class="card"><h2>Next Date</h2><div id="next-date"><p class="empty">No upcoming dates</p></div></div>
         <div class="card"><h2>Weather</h2><div id="weather-display"><p class="empty">Loading weather...</p></div></div>
@@ -263,7 +358,7 @@ function getDashboardHTML(config) {
     <!-- MOODS TAB -->
     <div id="moods" class="tab-content">
       <div class="grid">
-        <div class="card"><h2>Log Mood</h2><form id="mood-form"><select name="partner" required style="margin-bottom:0.5rem"><option value="">Who are you?</option><option value="${P1}">${P1}</option><option value="${P2}">${P2}</option></select><select name="mood" required style="margin-bottom:0.5rem"><option value="">How are you feeling?</option><option value="great">&#128522; Great</option><option value="good">&#128578; Good</option><option value="okay">&#128528; Okay</option><option value="tired">&#128564; Tired</option><option value="stressed">&#128560; Stressed</option><option value="low">&#128532; Low</option></select><textarea name="note" placeholder="Any notes? (optional)" style="margin-bottom:0.5rem"></textarea><button type="submit" class="btn">Log Mood</button></form></div>
+        <div class="card"><h2>Log Mood</h2><form id="mood-form"><select name="partner" required style="margin-bottom:0.5rem"><option value="">Who are you?</option><option value="${P1HTML}">${P1HTML}</option><option value="${P2HTML}">${P2HTML}</option></select><select name="mood" required style="margin-bottom:0.5rem"><option value="">How are you feeling?</option><option value="great">&#128522; Great</option><option value="good">&#128578; Good</option><option value="okay">&#128528; Okay</option><option value="tired">&#128564; Tired</option><option value="stressed">&#128560; Stressed</option><option value="low">&#128532; Low</option></select><textarea name="note" placeholder="Any notes? (optional)" style="margin-bottom:0.5rem"></textarea><button type="submit" class="btn">Log Mood</button></form></div>
         <div class="card"><h2>Recent Moods</h2><div id="mood-history"><p class="empty">No mood entries yet</p></div></div>
       </div>
     </div>
@@ -271,7 +366,7 @@ function getDashboardHTML(config) {
     <!-- NOTES TAB -->
     <div id="notes" class="tab-content">
       <div class="grid">
-        <div class="card"><h2>Leave a Note</h2><form id="note-form"><select name="from" required style="margin-bottom:0.5rem"><option value="">From</option><option value="${P1}">${P1}</option><option value="${P2}">${P2}</option></select><textarea name="content" placeholder="Your note..." required style="margin-bottom:0.5rem"></textarea><button type="submit" class="btn">Post Note</button></form></div>
+        <div class="card"><h2>Leave a Note</h2><form id="note-form"><select name="from" required style="margin-bottom:0.5rem"><option value="">From</option><option value="${P1HTML}">${P1HTML}</option><option value="${P2HTML}">${P2HTML}</option></select><textarea name="content" placeholder="Your note..." required style="margin-bottom:0.5rem"></textarea><button type="submit" class="btn">Post Note</button></form></div>
         <div class="card" style="grid-column:span 2"><h2>Fridge Notes</h2><div id="notes-display"><p class="empty">No notes on the fridge</p></div></div>
       </div>
     </div>
@@ -317,8 +412,8 @@ function getDashboardHTML(config) {
               <option value="Other">Other</option>
             </select>
             <select name="added_by" required style="margin-bottom:0.5rem">
-              <option value="${P1}">${P1}</option>
-              <option value="${P2}">${P2}</option>
+              <option value="${P1HTML}">${P1HTML}</option>
+              <option value="${P2HTML}">${P2HTML}</option>
             </select>
             <button type="submit" class="btn">Add</button>
           </form>
@@ -438,8 +533,8 @@ function getDashboardHTML(config) {
   </div>
 
   <script>
-    const P1 = ${JSON.stringify(P1)};
-    const P2 = ${JSON.stringify(P2)};
+    const P1 = ${jsonForInlineScript(P1)};
+    const P2 = ${jsonForInlineScript(P2)};
 
     /* === Tab Navigation === */
     document.querySelectorAll('nav a[data-tab]').forEach(link=>{link.addEventListener('click',e=>{e.preventDefault();const tab=e.target.dataset.tab;document.querySelectorAll('.tab-content').forEach(t=>t.classList.remove('active'));document.querySelectorAll('nav a[data-tab]').forEach(l=>l.classList.remove('active'));document.getElementById(tab).classList.add('active');e.target.classList.add('active');window.location.hash=tab;if(tab==='pressure'&&_pressureGraphData)setTimeout(()=>drawPressureChart(_pressureGraphData),50)})});
@@ -464,7 +559,7 @@ function getDashboardHTML(config) {
     }catch(err){console.error(err)}}
 
     /* === Tab Loaders === */
-    async function loadMoods(){try{const data=await api('/moods');const c=document.getElementById('mood-history');if(data.moods&&data.moods.length>0){c.innerHTML=data.moods.map(m=>'<div class="moment-item"><strong>'+sanitize(m.partner)+'</strong>: '+moodEmoji(m.mood)+' '+m.mood+(m.note?'<br><small style="color:#71717a">'+sanitize(m.note)+'</small>':'')+'<div class="moment-date">'+timeAgo(m.created_at)+'</div></div>').join('')}}catch(err){console.error(err)}}
+    async function loadMoods(){try{const data=await api('/moods');const c=document.getElementById('mood-history');if(data.moods&&data.moods.length>0){c.innerHTML=data.moods.map(m=>'<div class="moment-item"><strong>'+sanitize(m.partner)+'</strong>: '+moodEmoji(m.mood)+' '+sanitize(m.mood)+(m.note?'<br><small style="color:#71717a">'+sanitize(m.note)+'</small>':'')+'<div class="moment-date">'+timeAgo(m.created_at)+'</div></div>').join('')}}catch(err){console.error(err)}}
     async function loadNotes(){try{const data=await api('/notes');const c=document.getElementById('notes-display');if(data.notes&&data.notes.length>0){c.innerHTML=data.notes.map(n=>'<div class="note-card">"'+sanitize(n.content)+'"<div class="note-meta">\\u2014 '+sanitize(n.from_partner)+', '+timeAgo(n.created_at)+'</div></div>').join('')}}catch(err){console.error(err)}}
     async function loadMoments(){try{const data=await api('/moments');const c=document.getElementById('moments-timeline');if(data.moments&&data.moments.length>0){c.innerHTML=data.moments.map(m=>'<div class="moment-item"><strong>'+sanitize(m.title)+'</strong>'+(m.description?'<br><small style="color:#71717a">'+sanitize(m.description)+'</small>':'')+'<div class="moment-date">'+new Date(m.date).toLocaleDateString('en-GB',{day:'numeric',month:'long',year:'numeric'})+'</div></div>').join('')}}catch(err){console.error(err)}}
 
@@ -513,49 +608,47 @@ function getDashboardHTML(config) {
 
 /* ========================= BACKEND ========================= */
 
-export default {
+export const applicationHandler = {
   async fetch(request, env, ctx) {
-    const config = await getConfig(env);
+    const config = getConfig(env);
     const url = new URL(request.url);
     const path = url.pathname;
 
     // MCP endpoint
-    if (path.startsWith('/mcp/' + config.MCP_SECRET)) return handleMCP(request, env, config);
-
-    // Setup — no password set yet, let them create one
-    if (!config.PASSWORD) {
-      if (path === '/setup' && request.method === 'POST') {
-        const formData = await request.formData();
-        const pw = formData.get('password');
-        const confirm = formData.get('confirm');
-        if (!pw || pw.length < 4) {
-          return new Response(getSetupPage('<p class="error">Password must be at least 4 characters</p>'), { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
-        }
-        if (pw !== confirm) {
-          return new Response(getSetupPage('<p class="error">Passwords don\'t match</p>'), { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
-        }
-        await env.DB.prepare("INSERT OR REPLACE INTO config (key, value) VALUES ('password', ?)").bind(pw).run();
-        return new Response(null, { status: 302, headers: { 'Location': '/', 'Set-Cookie': `hearth_session=${pw}; Path=/; HttpOnly; SameSite=Strict; Max-Age=604800` } });
-      }
-      return new Response(getSetupPage(), { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
+    if (!config.PASSWORD || !config.SESSION_SECRET) {
+      return new Response('Hearth Dash is not configured. Set DASHBOARD_PASSWORD and SESSION_SECRET as Cloudflare Worker secrets.', {
+        status: 503,
+        headers: securityHeaders({ 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'no-store' }),
+      });
     }
 
     // Auth
-    const sessionCookie = getCookie(request, 'hearth_session');
-    const isAuthenticated = sessionCookie === config.PASSWORD;
+    const sessionToken = getCookie(request, '__Host-hearth_session');
+    const isAuthenticated = await verifySession(sessionToken, config.SESSION_SECRET);
 
     if (path === '/login') {
       if (request.method === 'POST') {
-        const formData = await request.formData();
-        if (formData.get('password') === config.PASSWORD) {
-          return new Response(null, { status: 302, headers: { 'Location': '/', 'Set-Cookie': `hearth_session=${config.PASSWORD}; Path=/; HttpOnly; SameSite=Strict; Max-Age=604800` } });
+        if (!sameOrigin(request)) return new Response('Forbidden', { status: 403 });
+        if (Number(request.headers.get('Content-Length') || 0) > 16 * 1024) return new Response('Request body is too large', { status: 413 });
+        if (!(await withinRateLimit(env, request, 'login', 10, 600))) {
+          return new Response('Too many login attempts. Try again later.', { status: 429, headers: securityHeaders({ 'Retry-After': '600' }) });
         }
-        return new Response(getLoginPage(config).replace('{{ERROR}}', '<p class="error">Wrong password</p>'), { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
+        const formData = await request.formData();
+        if (await safeEqual(formData.get('password'), config.PASSWORD)) {
+          const session = await createSession(config.SESSION_SECRET);
+          return new Response(null, { status: 302, headers: securityHeaders({ 'Location': '/', 'Set-Cookie': sessionCookie(session), 'Cache-Control': 'no-store' }) });
+        }
+        return new Response(getLoginPage(config).replace('{{ERROR}}', '<p class="error">Wrong password</p>'), { status: 401, headers: securityHeaders({ 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' }) });
       }
-      return new Response(getLoginPage(config).replace('{{ERROR}}', ''), { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
+      if (!['GET', 'HEAD'].includes(request.method)) return new Response(null, { status: 405, headers: securityHeaders({ 'Allow': 'GET, POST' }) });
+      return new Response(getLoginPage(config).replace('{{ERROR}}', ''), { headers: securityHeaders({ 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' }) });
     }
-    if (path === '/logout') return new Response(null, { status: 302, headers: { 'Location': '/login', 'Set-Cookie': 'hearth_session=; Path=/; Max-Age=0' } });
+    if (path === '/logout') return new Response(null, { status: 302, headers: securityHeaders({ 'Location': '/login', 'Set-Cookie': sessionCookie('', 0), 'Cache-Control': 'no-store' }) });
     if (!isAuthenticated) return Response.redirect(url.origin + '/login', 302);
+
+    if (!['GET', 'HEAD'].includes(request.method) && !sameOrigin(request)) {
+      return new Response('Forbidden', { status: 403 });
+    }
 
     // API routes
     if (path === '/api/weather') return handleWeather(env);
@@ -567,9 +660,142 @@ export default {
     }
     if (path.startsWith('/api/')) return handleAPI(request, env, path.substring(4), config);
 
-    return new Response(getDashboardHTML(config), { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
+    return new Response(getDashboardHTML(config), { headers: securityHeaders({ 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' }) });
   }
 };
+
+const OAUTH_SCOPES = ['hearth:read', 'hearth:write'];
+const OAUTH_CSRF_COOKIE = '__Host-hearth_oauth_csrf';
+
+export const oauthApiHandler = {
+  async fetch(request, env, ctx) {
+    const config = getConfig(env);
+    const remainder = new URL(request.url).pathname.substring('/mcp'.length);
+    const bearer = request.headers.get('Authorization')?.match(/^Bearer\s+(.+)$/i)?.[1];
+    const token = bearer ? await env.OAUTH_PROVIDER.unwrapToken(bearer) : null;
+    const scopes = Array.isArray(token?.scope) ? token.scope : [];
+    return handleMCP(request, env, config, remainder, scopes);
+  },
+};
+
+export const oauthDefaultHandler = {
+  async fetch(request, env, ctx) {
+    const url = new URL(request.url);
+    if (url.pathname !== '/authorize') return applicationHandler.fetch(request, env, ctx);
+
+    const config = getConfig(env);
+    if (!config.PASSWORD || !config.SESSION_SECRET) {
+      return new Response('Hearth Dash is not configured.', { status: 503, headers: securityHeaders() });
+    }
+    if (!['GET', 'POST'].includes(request.method)) {
+      return new Response(null, { status: 405, headers: securityHeaders({ Allow: 'GET, POST' }) });
+    }
+
+    let oauthRequest;
+    try {
+      oauthRequest = await env.OAUTH_PROVIDER.parseAuthRequest(request);
+    } catch (error) {
+      return renderOAuthAuthorizationError(error);
+    }
+    const client = await env.OAUTH_PROVIDER.lookupClient(oauthRequest.clientId);
+    if (!client) return new Response('Unknown OAuth client', { status: 400, headers: securityHeaders() });
+
+    const sessionToken = getCookie(request, '__Host-hearth_session');
+    const signedIn = await verifySession(sessionToken, config.SESSION_SECRET);
+
+    if (request.method === 'GET') {
+      const csrf = base64Url(crypto.getRandomValues(new Uint8Array(32)));
+      const headers = new Headers(securityHeaders({ 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' }));
+      headers.append('Set-Cookie', `${OAUTH_CSRF_COOKIE}=${csrf}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=600`);
+      return new Response(renderOAuthConsentPage(request.url, oauthRequest, client, csrf, signedIn), { headers });
+    }
+
+    if (!sameOrigin(request)) return new Response('Forbidden', { status: 403, headers: securityHeaders() });
+    if (Number(request.headers.get('Content-Length') || 0) > 16 * 1024) return new Response('Request body is too large', { status: 413 });
+    if (!(await withinRateLimit(env, request, 'oauth-consent', 10, 600))) {
+      return new Response('Too many authorization attempts. Try again later.', { status: 429, headers: securityHeaders({ 'Retry-After': '600' }) });
+    }
+
+    const form = await request.formData();
+    const csrfCookie = getCookie(request, OAUTH_CSRF_COOKIE);
+    if (!csrfCookie || !(await safeEqual(csrfCookie, form.get('csrf_token')))) {
+      return new Response('Authorization form expired. Start the connection again.', { status: 400, headers: securityHeaders() });
+    }
+    if (form.get('decision') === 'deny') return redirectOAuthDenial(oauthRequest);
+
+    let authenticated = signedIn;
+    let newSession = null;
+    if (!authenticated) {
+      authenticated = await safeEqual(form.get('password'), config.PASSWORD);
+      if (authenticated) newSession = await createSession(config.SESSION_SECRET);
+    }
+    if (!authenticated) {
+      const csrf = base64Url(crypto.getRandomValues(new Uint8Array(32)));
+      const headers = new Headers(securityHeaders({ 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' }));
+      headers.append('Set-Cookie', `${OAUTH_CSRF_COOKIE}=${csrf}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=600`);
+      return new Response(renderOAuthConsentPage(request.url, oauthRequest, client, csrf, false, 'Wrong dashboard password'), { status: 401, headers });
+    }
+
+    const requestedScopes = oauthRequest.scope?.length ? oauthRequest.scope : ['hearth:read'];
+    const grantedScopes = requestedScopes.filter(scope => OAUTH_SCOPES.includes(scope));
+    const { redirectTo } = await env.OAUTH_PROVIDER.completeAuthorization({
+      request: oauthRequest,
+      userId: 'hearth-owner',
+      metadata: { clientName: client.clientName || 'MCP client' },
+      scope: grantedScopes,
+      props: { userId: 'hearth-owner', scopes: grantedScopes },
+    });
+
+    const headers = new Headers(securityHeaders({ Location: redirectTo, 'Cache-Control': 'no-store' }));
+    headers.append('Set-Cookie', `${OAUTH_CSRF_COOKIE}=; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=0`);
+    if (newSession) headers.append('Set-Cookie', sessionCookie(newSession));
+    return new Response(null, { status: 302, headers });
+  },
+};
+
+function renderOAuthAuthorizationError(error) {
+  if (!error || typeof error.code !== 'string') return new Response('Invalid authorization request', { status: 400, headers: securityHeaders() });
+  if (!error.redirectUri) return new Response(error.description || 'Invalid authorization request', { status: 400, headers: securityHeaders() });
+  const redirect = new URL(error.redirectUri);
+  redirect.searchParams.set('error', error.code);
+  redirect.searchParams.set('error_description', error.description || 'Authorization failed');
+  if (error.state) redirect.searchParams.set('state', error.state);
+  if (error.issuer) redirect.searchParams.set('iss', error.issuer);
+  return Response.redirect(redirect, 302);
+}
+
+function redirectOAuthDenial(oauthRequest) {
+  const redirect = new URL(oauthRequest.redirectUri);
+  redirect.searchParams.set('error', 'access_denied');
+  redirect.searchParams.set('error_description', 'The Hearth owner denied access.');
+  if (oauthRequest.state) redirect.searchParams.set('state', oauthRequest.state);
+  if (oauthRequest.issuer) redirect.searchParams.set('iss', oauthRequest.issuer);
+  return Response.redirect(redirect, 302);
+}
+
+function renderOAuthConsentPage(action, oauthRequest, client, csrf, signedIn, error = '') {
+  const clientName = escapeHtml(client.clientName || 'An MCP client');
+  const redirectHost = escapeHtml(new URL(oauthRequest.redirectUri).host);
+  const scopes = (oauthRequest.scope?.length ? oauthRequest.scope : ['hearth:read'])
+    .filter(scope => OAUTH_SCOPES.includes(scope));
+  const permissions = scopes.map(scope => scope === 'hearth:write'
+    ? '<li><strong>Write:</strong> add moods, notes, moments, dates, shopping items and food reviews</li>'
+    : '<li><strong>Read:</strong> view the shared Hearth dashboard data</li>').join('');
+  return `<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Authorize Hearth</title><style>
+body{font-family:system-ui,sans-serif;background:#0f0f1a;color:#fafafa;min-height:100vh;display:grid;place-items:center;margin:0}.box{background:#1a1a2e;border:1px solid #34344a;border-radius:16px;padding:2rem;max-width:520px;width:calc(100% - 3rem)}h1{margin-top:0}.muted{color:#a1a1aa}.error{color:#f87171}input{box-sizing:border-box;width:100%;padding:.9rem;background:#0f0f1a;color:#fff;border:1px solid #45455f;border-radius:8px;margin:.5rem 0 1rem}.actions{display:flex;gap:.75rem}.actions button{padding:.8rem 1rem;border-radius:8px;border:0;font-weight:650;cursor:pointer}.approve{background:#a855f7;color:white}.deny{background:#34344a;color:white}code{word-break:break-all;color:#c4b5fd}
+</style></head><body><main class="box"><h1>Authorize Hearth</h1>
+<p><strong>${clientName}</strong> wants access to this private dashboard.</p><ul>${permissions}</ul>
+<p class="muted">After approval you will return to <code>${redirectHost}</code>. Access is token-based and expires; remove or revoke the connector to end access.</p>
+${error ? `<p class="error">${escapeHtml(error)}</p>` : ''}
+<form method="post" action="${escapeHtml(action)}"><input type="hidden" name="csrf_token" value="${escapeHtml(csrf)}">
+${signedIn ? '' : '<label>Dashboard password<input type="password" name="password" autocomplete="current-password" required></label>'}
+<div class="actions"><button class="approve" type="submit" name="decision" value="approve">Approve</button><button class="deny" type="submit" name="decision" value="deny">Deny</button></div>
+</form></main></body></html>`;
+}
+
+export default applicationHandler;
 
 /* ========================= REST API ========================= */
 
@@ -595,19 +821,37 @@ async function handleAPI(request, env, endpoint, config) {
 
     /* Moods */
     if (endpoint === '/moods' && method === 'GET') { const r = await env.DB.prepare('SELECT * FROM moods ORDER BY created_at DESC LIMIT 20').all(); return json({ moods: r.results }); }
-    if (endpoint === '/moods' && method === 'POST') { const b = await request.json(); await env.DB.prepare('INSERT INTO moods (partner, mood, note, created_at) VALUES (?, ?, ?, datetime("now"))').bind(b.partner, b.mood, b.note || null).run(); return json({ success: true }); }
+    if (endpoint === '/moods' && method === 'POST') {
+      const b = await readJsonObject(request);
+      const partner = requireText(b, 'partner', 80, [config.PARTNER_1, config.PARTNER_2]);
+      const mood = requireText(b, 'mood', 20, ['great', 'good', 'okay', 'tired', 'stressed', 'low']);
+      await env.DB.prepare('INSERT INTO moods (partner, mood, note, created_at) VALUES (?, ?, ?, datetime("now"))').bind(partner, mood, optionalText(b, 'note', 2000)).run();
+      return json({ success: true });
+    }
 
     /* Notes */
     if (endpoint === '/notes' && method === 'GET') { const r = await env.DB.prepare('SELECT * FROM notes ORDER BY created_at DESC LIMIT 20').all(); return json({ notes: r.results }); }
-    if (endpoint === '/notes' && method === 'POST') { const b = await request.json(); await env.DB.prepare('INSERT INTO notes (from_partner, content, created_at) VALUES (?, ?, datetime("now"))').bind(b.from, b.content).run(); return json({ success: true }); }
+    if (endpoint === '/notes' && method === 'POST') {
+      const b = await readJsonObject(request);
+      await env.DB.prepare('INSERT INTO notes (from_partner, content, created_at) VALUES (?, ?, datetime("now"))').bind(requireText(b, 'from', 80), requireText(b, 'content', 4000)).run();
+      return json({ success: true });
+    }
 
     /* Moments */
     if (endpoint === '/moments' && method === 'GET') { const r = await env.DB.prepare('SELECT * FROM moments ORDER BY date DESC').all(); return json({ moments: r.results }); }
-    if (endpoint === '/moments' && method === 'POST') { const b = await request.json(); await env.DB.prepare('INSERT INTO moments (date, title, description, created_at) VALUES (?, ?, ?, datetime("now"))').bind(b.date, b.title, b.description || null).run(); return json({ success: true }); }
+    if (endpoint === '/moments' && method === 'POST') {
+      const b = await readJsonObject(request);
+      await env.DB.prepare('INSERT INTO moments (date, title, description, created_at) VALUES (?, ?, ?, datetime("now"))').bind(requireDate(b), requireText(b, 'title', 200), optionalText(b, 'description', 4000)).run();
+      return json({ success: true });
+    }
 
     /* Dates */
     if (endpoint === '/dates' && method === 'GET') { const r = await env.DB.prepare('SELECT * FROM dates ORDER BY date ASC').all(); return json({ dates: r.results }); }
-    if (endpoint === '/dates' && method === 'POST') { const b = await request.json(); await env.DB.prepare('INSERT INTO dates (date, title, recurring, created_at) VALUES (?, ?, ?, datetime("now"))').bind(b.date, b.title, b.recurring ? 1 : 0).run(); return json({ success: true }); }
+    if (endpoint === '/dates' && method === 'POST') {
+      const b = await readJsonObject(request);
+      await env.DB.prepare('INSERT INTO dates (date, title, recurring, created_at) VALUES (?, ?, ?, datetime("now"))').bind(requireDate(b), requireText(b, 'title', 200), b.recurring === true ? 1 : 0).run();
+      return json({ success: true });
+    }
     const dateDelMatch = endpoint.match(/^\/dates\/(\d+)$/);
     if (dateDelMatch && method === 'DELETE') {
       await env.DB.prepare('DELETE FROM dates WHERE id = ?').bind(+dateDelMatch[1]).run();
@@ -620,8 +864,11 @@ async function handleAPI(request, env, endpoint, config) {
       return json({ items: r.results });
     }
     if (endpoint === '/shopping' && method === 'POST') {
-      const b = await request.json();
-      await env.DB.prepare('INSERT INTO shopping (item, category, checked, added_by, created_at) VALUES (?, ?, 0, ?, datetime("now"))').bind(b.item, b.category || 'Other', b.added_by || config.PARTNER_1).run();
+      const b = await readJsonObject(request);
+      const item = requireText(b, 'item', 300);
+      const category = b.category ? requireText(b, 'category', 100) : 'Other';
+      const addedBy = b.added_by ? requireText(b, 'added_by', 80) : config.PARTNER_1;
+      await env.DB.prepare('INSERT INTO shopping (item, category, checked, added_by, created_at) VALUES (?, ?, 0, ?, datetime("now"))').bind(item, category, addedBy).run();
       return json({ success: true });
     }
     if (endpoint === '/shopping/checked' && method === 'DELETE') {
@@ -648,10 +895,12 @@ async function handleAPI(request, env, endpoint, config) {
       return json({ entries: r.results });
     }
     if (endpoint === '/food' && method === 'POST') {
-      const b = await request.json();
-      const date = b.date || new Date().toISOString().slice(0, 10);
-      const time = b.time || new Date().toISOString().slice(11, 16);
-      await env.DB.prepare('INSERT INTO food_diary (date, time, meal_type, note, photo_key, created_at) VALUES (?, ?, ?, ?, ?, datetime("now"))').bind(date, time, b.meal_type, b.note || null, b.photo_key || null).run();
+      const b = await readJsonObject(request);
+      const date = b.date ? requireDate(b) : new Date().toISOString().slice(0, 10);
+      const time = b.time ? requireText(b, 'time', 5) : new Date().toISOString().slice(11, 16);
+      if (!/^\d{2}:\d{2}$/.test(time)) throw Object.assign(new Error('time must use HH:MM'), { status: 400 });
+      const mealType = requireText(b, 'meal_type', 20, ['breakfast', 'lunch', 'dinner', 'snack']);
+      await env.DB.prepare('INSERT INTO food_diary (date, time, meal_type, note, photo_key, created_at) VALUES (?, ?, ?, ?, ?, datetime("now"))').bind(date, time, mealType, optionalText(b, 'note', 4000), optionalText(b, 'photo_key', 500)).run();
       return json({ success: true });
     }
     const foodDelMatch = endpoint.match(/^\/food\/(\d+)$/);
@@ -679,9 +928,10 @@ async function handleAPI(request, env, endpoint, config) {
       return json({ entries: r.results, total_ml: total });
     }
     if (endpoint === '/water' && method === 'POST') {
-      const b = await request.json();
-      const date = b.date || new Date().toISOString().slice(0, 10);
-      const amount = b.amount_ml || 250;
+      const b = await readJsonObject(request);
+      const date = b.date ? requireDate(b) : new Date().toISOString().slice(0, 10);
+      const amount = b.amount_ml === undefined ? 250 : b.amount_ml;
+      if (!Number.isInteger(amount) || amount < 1 || amount > 5000) throw Object.assign(new Error('amount_ml must be an integer between 1 and 5000'), { status: 400 });
       await env.DB.prepare('INSERT INTO water_log (date, amount_ml, created_at) VALUES (?, ?, datetime("now"))').bind(date, amount).run();
       const r = date
         ? await env.DB.prepare('SELECT SUM(amount_ml) as total FROM water_log WHERE date = ?').bind(date).first()
@@ -705,43 +955,268 @@ async function handleAPI(request, env, endpoint, config) {
       return json({ reviews: r.results });
     }
     if (endpoint === '/food/reviews' && method === 'POST') {
-      const b = await request.json();
-      await env.DB.prepare('INSERT OR REPLACE INTO food_reviews (date, review, reviewer, created_at) VALUES (?, ?, ?, datetime("now"))').bind(b.date, b.review, b.reviewer || 'AI').run();
+      const b = await readJsonObject(request);
+      await env.DB.prepare('INSERT OR REPLACE INTO food_reviews (date, review, reviewer, created_at) VALUES (?, ?, ?, datetime("now"))').bind(requireDate(b), requireText(b, 'review', 6000), b.reviewer ? requireText(b, 'reviewer', 80) : 'AI').run();
       return json({ success: true });
     }
 
     return json({ error: 'Not found' }, 404);
-  } catch (err) { return json({ error: err.message }, 500); }
+  } catch (err) { return json({ error: err.status && err.status < 500 ? err.message : 'Request failed' }, err.status || 500); }
 }
 
 /* ========================= MCP ========================= */
 
-async function handleMCP(request, env, config) {
-  const mcpPath = new URL(request.url).pathname.substring(('/mcp/' + config.MCP_SECRET).length);
-  if (mcpPath.startsWith('/photo/') && request.method === 'GET') {
-    const key = decodeURIComponent(mcpPath.substring('/photo/'.length));
-    return handleFoodPhotoServe(key, env);
+const MCP_TOOLS = [
+  toolDefinition('hearth_status', 'Dashboard status', 'Read the current Hearth overview.', {}, true),
+  toolDefinition('hearth_mood', 'Mood log', 'Read recent moods or record a mood.', {
+    action: enumProperty(['get', 'set'], 'Whether to read or record a mood.'),
+    partner: stringProperty('Partner name.', 80),
+    mood: enumProperty(['great', 'good', 'okay', 'tired', 'stressed', 'low'], 'Mood to record.'),
+    note: stringProperty('Optional private note.', 2000),
+  }, false, ['action']),
+  toolDefinition('hearth_note', 'Fridge notes', 'Read or leave a shared fridge note.', {
+    action: enumProperty(['get', 'leave'], 'Whether to read or leave notes.'),
+    limit: integerProperty('Number of notes to read.', 1, 20),
+    from: stringProperty('Author name.', 80),
+    content: stringProperty('Note text.', 4000),
+  }, false, ['action']),
+  toolDefinition('hearth_moment', 'Shared moments', 'List or add a dated shared moment.', {
+    action: enumProperty(['list', 'add'], 'Whether to list or add moments.'),
+    limit: integerProperty('Number of moments to read.', 1, 50),
+    date: stringProperty('Date in YYYY-MM-DD format.', 10),
+    title: stringProperty('Moment title.', 200),
+    description: stringProperty('Optional description.', 4000),
+  }, false, ['action']),
+  toolDefinition('hearth_date', 'Important dates', 'Read upcoming dates or add one.', {
+    action: enumProperty(['upcoming', 'add'], 'Whether to read or add dates.'),
+    limit: integerProperty('Number of dates to read.', 1, 50),
+    date: stringProperty('Date in YYYY-MM-DD format.', 10),
+    title: stringProperty('Date title.', 200),
+    recurring: { type: 'boolean', description: 'Whether this repeats yearly.' },
+  }, false, ['action']),
+  toolDefinition('hearth_shopping_list', 'Shopping list', 'Read unchecked shopping-list items.', {}, true),
+  toolDefinition('hearth_shopping_add', 'Add shopping item', 'Add one item to the shopping list.', {
+    item: stringProperty('Item to add.', 300),
+    category: stringProperty('Optional category.', 100),
+    added_by: stringProperty('Name of the person adding it.', 80),
+  }, false, ['item']),
+  toolDefinition('hearth_pressure', 'Pressure and migraine risk', 'Read current, historical, or forecast barometric pressure.', {
+    action: enumProperty(['status', 'history', 'forecast'], 'Pressure view to return.'),
+    hours: integerProperty('History window in hours.', 1, 720),
+  }, true),
+  toolDefinition('hearth_food_diary_today', 'Today food diary', 'Read today\'s meals, water and review status.', {}, true),
+  toolDefinition('hearth_food_diary_history', 'Food diary history', 'Read food and water history over a bounded date range.', {
+    days: integerProperty('Days to include when dates are omitted.', 1, 90),
+    from: stringProperty('Start date in YYYY-MM-DD format.', 10),
+    to: stringProperty('End date in YYYY-MM-DD format.', 10),
+  }, true),
+  toolDefinition('hearth_food_review', 'Save food review', 'Save or replace an AI food-diary review for a date.', {
+    date: stringProperty('Date in YYYY-MM-DD format.', 10),
+    review: stringProperty('Review text.', 6000),
+    reviewer: stringProperty('Reviewer name.', 80),
+  }, false, ['date', 'review']),
+  toolDefinition('hearth_water_status', 'Water status', 'Read today\'s and recent water totals.', {}, true),
+];
+
+function stringProperty(description, maxLength) {
+  return { type: 'string', description, minLength: 1, maxLength };
+}
+
+function integerProperty(description, minimum, maximum) {
+  return { type: 'integer', description, minimum, maximum };
+}
+
+function enumProperty(values, description) {
+  return { type: 'string', enum: values, description };
+}
+
+function toolDefinition(name, title, description, properties, readOnlyHint, required = []) {
+  return {
+    name, title, description,
+    inputSchema: { type: 'object', properties, required, additionalProperties: false },
+    annotations: { title, readOnlyHint, destructiveHint: false, idempotentHint: readOnlyHint, openWorldHint: false },
+  };
+}
+
+function rpcResult(id, result, status = 200) {
+  return new Response(JSON.stringify({ jsonrpc: '2.0', id, result }), {
+    status,
+    headers: securityHeaders({ 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' }),
+  });
+}
+
+function rpcError(id, code, message, status = 200, data) {
+  const error = { code, message };
+  if (data !== undefined) error.data = data;
+  return new Response(JSON.stringify({ jsonrpc: '2.0', id: id ?? null, error }), {
+    status,
+    headers: securityHeaders({ 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' }),
+  });
+}
+
+function validateMcpOrigin(request, config) {
+  const origin = request.headers.get('Origin');
+  if (!origin) return true;
+  if (origin === new URL(request.url).origin) return true;
+  return config.MCP_ALLOWED_ORIGINS.includes(origin);
+}
+
+function validateArguments(tool, args) {
+  if (!args || typeof args !== 'object' || Array.isArray(args)) return 'arguments must be an object';
+  const schema = tool.inputSchema;
+  for (const required of schema.required || []) {
+    if (args[required] === undefined || args[required] === null || args[required] === '') return required + ' is required';
   }
-  if (request.method !== 'POST') return json({ error: 'Method not allowed' }, 405);
-  try {
-    const body = await request.json();
-    const { tool, params } = body;
-    switch (tool) {
-      case 'hearth_status': return await mcpStatus(env, config);
-      case 'hearth_mood': return await mcpMood(env, params, config);
-      case 'hearth_note': return await mcpNote(env, params);
-      case 'hearth_moment': return await mcpMoment(env, params);
-      case 'hearth_date': return await mcpDate(env, params);
-      case 'hearth_shopping_list': return await mcpShoppingList(env);
-      case 'hearth_shopping_add': return await mcpShoppingAdd(env, params, config);
-      case 'hearth_pressure': return await mcpPressure(env, params);
-      case 'hearth_food_diary_today': return await mcpFoodDiaryToday(env, config, new URL(request.url).origin);
-      case 'hearth_food_diary_history': return await mcpFoodDiaryHistory(env, params);
-      case 'hearth_food_review': return await mcpFoodReview(env, params);
-      case 'hearth_water_status': return await mcpWaterStatus(env);
-      default: return json({ error: 'Unknown tool', available: ['hearth_status','hearth_mood','hearth_note','hearth_moment','hearth_date','hearth_shopping_list','hearth_shopping_add','hearth_pressure','hearth_food_diary_today','hearth_food_diary_history','hearth_food_review','hearth_water_status'] });
+  for (const [key, value] of Object.entries(args)) {
+    const property = schema.properties[key];
+    if (!property) return 'unknown argument: ' + key;
+    if (property.type === 'string') {
+      if (typeof value !== 'string') return key + ' must be a string';
+      if (property.minLength && value.length < property.minLength) return key + ' is too short';
+      if (property.maxLength && value.length > property.maxLength) return key + ' is too long';
+      if (property.enum && !property.enum.includes(value)) return key + ' must be one of: ' + property.enum.join(', ');
+    } else if (property.type === 'integer') {
+      if (!Number.isInteger(value) || value < property.minimum || value > property.maximum) return key + ' is out of range';
+    } else if (property.type === 'boolean' && typeof value !== 'boolean') {
+      return key + ' must be a boolean';
     }
-  } catch (err) { return json({ error: err.message }, 500); }
+  }
+  const requiredForAction = {
+    hearth_mood: { set: ['partner', 'mood'] },
+    hearth_note: { leave: ['from', 'content'] },
+    hearth_moment: { add: ['date', 'title'] },
+    hearth_date: { add: ['date', 'title'] },
+  };
+  for (const key of requiredForAction[tool.name]?.[args.action] || []) {
+    if (args[key] === undefined || args[key] === null || args[key] === '') return key + ' is required for ' + args.action;
+  }
+  for (const key of ['date', 'from', 'to']) {
+    if (args[key] !== undefined && !/^\d{4}-\d{2}-\d{2}$/.test(args[key])) return key + ' must use YYYY-MM-DD';
+  }
+  return null;
+}
+
+async function executeMcpTool(name, params, env, config) {
+  switch (name) {
+    case 'hearth_status': return mcpStatus(env, config);
+    case 'hearth_mood': return mcpMood(env, params, config);
+    case 'hearth_note': return mcpNote(env, params);
+    case 'hearth_moment': return mcpMoment(env, params);
+    case 'hearth_date': return mcpDate(env, params);
+    case 'hearth_shopping_list': return mcpShoppingList(env);
+    case 'hearth_shopping_add': return mcpShoppingAdd(env, params, config);
+    case 'hearth_pressure': return mcpPressure(env, params);
+    case 'hearth_food_diary_today': return mcpFoodDiaryToday(env, config);
+    case 'hearth_food_diary_history': return mcpFoodDiaryHistory(env, params);
+    case 'hearth_food_review': return mcpFoodReview(env, params);
+    case 'hearth_water_status': return mcpWaterStatus(env);
+    default: return null;
+  }
+}
+
+function requiredScopeForCall(name, args) {
+  if (name === 'hearth_shopping_add' || name === 'hearth_food_review') return 'hearth:write';
+  if (name === 'hearth_mood' && args.action === 'set') return 'hearth:write';
+  if (name === 'hearth_note' && args.action === 'leave') return 'hearth:write';
+  if (name === 'hearth_moment' && args.action === 'add') return 'hearth:write';
+  if (name === 'hearth_date' && args.action === 'add') return 'hearth:write';
+  return 'hearth:read';
+}
+
+function visibleToolsForScopes(scopes) {
+  if (scopes.includes('hearth:read') && scopes.includes('hearth:write')) return MCP_TOOLS;
+  if (scopes.includes('hearth:read')) {
+    return MCP_TOOLS.filter(tool => !['hearth_shopping_add', 'hearth_food_review'].includes(tool.name));
+  }
+  if (scopes.includes('hearth:write')) return MCP_TOOLS.filter(tool => !tool.annotations.readOnlyHint);
+  return [];
+}
+
+async function handleMCP(request, env, config, remainder, scopes = []) {
+  if (remainder && remainder !== '/') return json({ error: 'Not found' }, 404);
+  if (!validateMcpOrigin(request, config)) return json({ error: 'Forbidden origin' }, 403);
+  if (!(await withinRateLimit(env, request, 'mcp', 120, 60))) {
+    return rpcError(null, -32000, 'Rate limit exceeded', 429);
+  }
+  if (request.method === 'GET') {
+    return new Response(null, { status: 405, headers: securityHeaders({ 'Allow': 'POST' }) });
+  }
+  if (request.method !== 'POST') return new Response(null, { status: 405, headers: securityHeaders({ 'Allow': 'POST' }) });
+
+  const contentType = request.headers.get('Content-Type') || '';
+  if (!contentType.toLowerCase().startsWith('application/json')) return rpcError(null, -32600, 'Content-Type must be application/json', 415);
+  const declaredLength = Number(request.headers.get('Content-Length') || 0);
+  if (declaredLength > MAX_JSON_BODY_BYTES) return rpcError(null, -32600, 'Request body is too large', 413);
+
+  let message;
+  try {
+    const text = await request.text();
+    if (encoder.encode(text).byteLength > MAX_JSON_BODY_BYTES) return rpcError(null, -32600, 'Request body is too large', 413);
+    message = JSON.parse(text);
+  } catch {
+    return rpcError(null, -32700, 'Parse error', 400);
+  }
+  if (!message || Array.isArray(message) || message.jsonrpc !== '2.0' || typeof message.method !== 'string') {
+    return rpcError(message?.id, -32600, 'Invalid Request', 400);
+  }
+
+  if (message.method !== 'initialize') {
+    const protocolVersion = request.headers.get('MCP-Protocol-Version');
+    if (!protocolVersion || !MCP_PROTOCOL_VERSIONS.includes(protocolVersion)) {
+      return rpcError(message.id, -32600, 'Unsupported MCP protocol version', 400, { supported: MCP_PROTOCOL_VERSIONS });
+    }
+  }
+
+  const isNotification = message.id === undefined;
+  if (message.method === 'notifications/initialized' || message.method === 'notifications/cancelled') {
+    return new Response(null, { status: 202, headers: securityHeaders({ 'Cache-Control': 'no-store' }) });
+  }
+  if (isNotification) return new Response(null, { status: 202, headers: securityHeaders({ 'Cache-Control': 'no-store' }) });
+
+  if (message.method === 'initialize') {
+    const requested = message.params?.protocolVersion;
+    if (typeof requested !== 'string') return rpcError(message.id, -32602, 'protocolVersion is required', 400);
+    const protocolVersion = MCP_PROTOCOL_VERSIONS.includes(requested) ? requested : MCP_PROTOCOL_VERSIONS[0];
+    return rpcResult(message.id, {
+      protocolVersion,
+      capabilities: { tools: { listChanged: false } },
+      serverInfo: { name: 'hearth-dash', version: '1.1.0' },
+      instructions: 'Hearth is a private shared dashboard. Read tools do not change data; write tools change the shared household record.',
+    });
+  }
+
+  if (message.method === 'ping') return rpcResult(message.id, {});
+  if (message.method === 'tools/list') return rpcResult(message.id, { tools: visibleToolsForScopes(scopes) });
+  if (message.method !== 'tools/call') return rpcError(message.id, -32601, 'Method not found');
+
+  const name = message.params?.name;
+  const args = message.params?.arguments || {};
+  const tool = MCP_TOOLS.find(item => item.name === name);
+  if (!tool) return rpcError(message.id, -32602, 'Unknown tool: ' + String(name));
+  const validationError = validateArguments(tool, args);
+  if (validationError) {
+    return rpcResult(message.id, { content: [{ type: 'text', text: validationError }], isError: true });
+  }
+  const requiredScope = requiredScopeForCall(name, args);
+  if (!scopes.includes(requiredScope)) {
+    return rpcResult(message.id, {
+      content: [{ type: 'text', text: `Permission denied: ${requiredScope} scope is required` }],
+      isError: true,
+    });
+  }
+
+  try {
+    const toolResponse = await executeMcpTool(name, args, env, config);
+    const data = await toolResponse.json();
+    const isError = !toolResponse.ok || !!data.error;
+    return rpcResult(message.id, {
+      content: [{ type: 'text', text: JSON.stringify(data) }],
+      structuredContent: data,
+      isError,
+    });
+  } catch (error) {
+    return rpcResult(message.id, { content: [{ type: 'text', text: 'Tool execution failed' }], isError: true });
+  }
 }
 
 async function mcpStatus(env, config) {
@@ -853,14 +1328,13 @@ async function mcpPressure(env, params) {
   return json({ error: 'Invalid action. Use: status, history, forecast' });
 }
 
-async function mcpFoodDiaryToday(env, config, origin) {
+async function mcpFoodDiaryToday(env, config) {
   const [meals, water, review] = await Promise.all([
     env.DB.prepare("SELECT * FROM food_diary WHERE date = date('now') ORDER BY time ASC").all(),
     env.DB.prepare("SELECT SUM(amount_ml) as total FROM water_log WHERE date = date('now')").first(),
     env.DB.prepare("SELECT * FROM food_reviews WHERE date = date('now')").first()
   ]);
-  const baseUrl = origin + '/mcp/' + config.MCP_SECRET + '/photo/';
-  const entries = (meals.results || []).map(m => ({ id: m.id, meal_type: m.meal_type, time: m.time, note: m.note, has_photo: !!m.photo_key, photo_url: m.photo_key ? baseUrl + encodeURIComponent(m.photo_key) : null }));
+  const entries = (meals.results || []).map(m => ({ id: m.id, meal_type: m.meal_type, time: m.time, note: m.note, has_photo: !!m.photo_key }));
   const mealTypes = entries.map(e => e.meal_type);
   const logged = { breakfast: mealTypes.includes('breakfast'), lunch: mealTypes.includes('lunch'), dinner: mealTypes.includes('dinner') };
   const waterTotal = water ? water.total || 0 : 0;
@@ -926,7 +1400,7 @@ async function handleFoodPhotoUpload(request, env) {
     const key = 'food/' + date + '/' + id + '.' + ext;
     await env.PHOTOS.put(key, file.stream(), { httpMetadata: { contentType: file.type } });
     return json({ success: true, key });
-  } catch (err) { return json({ error: 'Upload failed: ' + err.message }, 500); }
+  } catch (err) { return json({ error: 'Upload failed' }, 500); }
 }
 
 async function handleFoodPhotoServe(key, env) {
@@ -935,9 +1409,11 @@ async function handleFoodPhotoServe(key, env) {
     if (!object) return new Response('Not found', { status: 404 });
     const headers = new Headers();
     headers.set('Content-Type', object.httpMetadata?.contentType || 'image/jpeg');
-    headers.set('Cache-Control', 'public, max-age=31536000, immutable');
+    headers.set('Cache-Control', 'private, no-store');
+    headers.set('X-Content-Type-Options', 'nosniff');
+    headers.set('Content-Security-Policy', "default-src 'none'");
     return new Response(object.body, { headers });
-  } catch (err) { return new Response('Error: ' + err.message, { status: 500 }); }
+  } catch (err) { return new Response('Could not load photo', { status: 500 }); }
 }
 
 /* ========================= WEATHER ========================= */
@@ -1015,7 +1491,7 @@ async function handleWeather(env) {
     };
     weatherCache = { data, ts: now };
     return json(data);
-  } catch (err) { return json({ error: 'Failed to fetch weather: ' + err.message }, 500); }
+  } catch (err) { return json({ error: 'Failed to fetch weather' }, 500); }
 }
 
 /* ========================= PRESSURE HISTORY ========================= */
@@ -1041,7 +1517,7 @@ async function handlePressure(env) {
       current = { pressure: last.pressure_hpa, timestamp: last.recorded_at };
     }
     return json({ history, forecast, current, migraine_days: [] });
-  } catch (err) { return json({ error: 'Pressure data error: ' + err.message }, 500); }
+  } catch (err) { return json({ error: 'Pressure data error' }, 500); }
 }
 
 /* ========================= UTILITIES ========================= */
@@ -1052,6 +1528,43 @@ function getCookie(request, name) {
   return match ? match[1] : null;
 }
 
+async function readJsonObject(request) {
+  const contentType = request.headers.get('Content-Type') || '';
+  if (!contentType.toLowerCase().startsWith('application/json')) {
+    throw Object.assign(new Error('Content-Type must be application/json'), { status: 415 });
+  }
+  const declaredLength = Number(request.headers.get('Content-Length') || 0);
+  if (declaredLength > MAX_JSON_BODY_BYTES) throw Object.assign(new Error('Request body is too large'), { status: 413 });
+  const text = await request.text();
+  if (encoder.encode(text).byteLength > MAX_JSON_BODY_BYTES) throw Object.assign(new Error('Request body is too large'), { status: 413 });
+  let value;
+  try { value = JSON.parse(text); } catch { throw Object.assign(new Error('Invalid JSON'), { status: 400 }); }
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw Object.assign(new Error('JSON body must be an object'), { status: 400 });
+  return value;
+}
+
+function requireText(body, key, maxLength, allowed) {
+  const value = body[key];
+  if (typeof value !== 'string' || !value.trim()) throw Object.assign(new Error(key + ' is required'), { status: 400 });
+  if (value.length > maxLength) throw Object.assign(new Error(key + ' is too long'), { status: 400 });
+  if (allowed && !allowed.includes(value)) throw Object.assign(new Error(key + ' is invalid'), { status: 400 });
+  return value.trim();
+}
+
+function optionalText(body, key, maxLength) {
+  if (body[key] === undefined || body[key] === null || body[key] === '') return null;
+  return requireText(body, key, maxLength);
+}
+
+function requireDate(body, key = 'date') {
+  const value = requireText(body, key, 10);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) throw Object.assign(new Error(key + ' must use YYYY-MM-DD'), { status: 400 });
+  return value;
+}
+
 function json(data, status = 200) {
-  return new Response(JSON.stringify(data), { status, headers: { 'Content-Type': 'application/json; charset=utf-8' } });
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: securityHeaders({ 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' }),
+  });
 }

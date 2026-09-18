@@ -1,4 +1,4 @@
-import { readFileSync, existsSync } from "node:fs";
+import { readFileSync, existsSync, chmodSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import { banner, bold, dim, cyan, warn, info } from "../lib/ui.js";
@@ -14,11 +14,13 @@ export default async function mcpCommand(args) {
   }
 
   const config = JSON.parse(readFileSync(CONFIG_PATH, "utf-8"));
-  const mcpUrl = config.workerUrl + "/mcp/" + config.mcpSecret;
+  const mcpUrl = config.workerUrl + "/mcp";
 
   console.log(bold("  MCP Configuration\n"));
 
   console.log(`  ${bold("Endpoint:")} ${cyan(mcpUrl)}\n`);
+  info("Hearth uses OAuth 2.1. Your dashboard password stays out of the connector URL and Claude stores only revocable tokens.");
+  console.log();
 
   console.log(`  ${bold("For Claude Code")} (add to ${dim("~/.claude.json")}):\n`);
   console.log(`  {`);
@@ -32,6 +34,7 @@ export default async function mcpCommand(args) {
   console.log(`  ${bold("For Claude Desktop")} (Settings > Developer > MCP):\n`);
   console.log(`  Name:     hearth-dash`);
   console.log(`  URL:      ${mcpUrl}\n`);
+  console.log(`  ${dim("When prompted, sign in with the Hearth dashboard password and approve access.")}\n`);
 
   console.log(`  ${bold("Connector URL")} (for Claude.ai mobile):`);
   console.log(`  ${cyan(mcpUrl)}\n`);
@@ -64,6 +67,7 @@ export default async function mcpCommand(args) {
     if (!claudeConfig.mcpServers) claudeConfig.mcpServers = {};
     claudeConfig.mcpServers["hearth-dash"] = { url: mcpUrl };
     writeFileSync(claudeConfigPath, JSON.stringify(claudeConfig, null, 2) + "\n", "utf-8");
+    try { chmodSync(claudeConfigPath, 0o600); } catch {}
     info("MCP config written to " + claudeConfigPath);
   }
 }

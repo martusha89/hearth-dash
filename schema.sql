@@ -6,6 +6,10 @@ CREATE TABLE IF NOT EXISTS config (
   value TEXT NOT NULL
 );
 
+-- v1.0.1's first-visit setup stored the dashboard password as plaintext.
+-- Authentication now uses Cloudflare Worker secrets; remove any legacy copy.
+DELETE FROM config WHERE key = 'password';
+
 CREATE TABLE IF NOT EXISTS moods (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   partner TEXT NOT NULL,
@@ -81,3 +85,11 @@ CREATE TABLE IF NOT EXISTS food_reviews (
   created_at TEXT DEFAULT (datetime('now'))
 );
 CREATE INDEX IF NOT EXISTS idx_food_reviews_date ON food_reviews(date);
+
+-- Coarse per-IP request buckets. IP addresses are hashed before storage.
+CREATE TABLE IF NOT EXISTS rate_limits (
+  bucket_key TEXT PRIMARY KEY,
+  count INTEGER NOT NULL DEFAULT 1,
+  expires_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_rate_limits_expires ON rate_limits(expires_at);

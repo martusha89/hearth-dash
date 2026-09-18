@@ -54,7 +54,7 @@ ${bold("Quick start:")}
   ${dim("$")} npx hearth-dash mcp
 
 ${bold("Requirements:")}
-  - Node.js 18+
+  - Node.js 22+
   - Cloudflare account (free tier works)
   - OpenWeatherMap API key (free at ${dim("https://openweathermap.org/api")})
 `);

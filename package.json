@@ -1,12 +1,13 @@
 {
   "name": "hearth-dash",
-  "version": "1.0.1",
+  "version": "1.1.0",
   "description": "Personal dashboard — moods, moments, food diary, weather, and more. Deploy to Cloudflare in one command.",
   "type": "module",
   "bin": {
     "hearth-dash": "cli/index.js"
   },
   "scripts": {
+    "test": "node --test",
     "dev": "npx wrangler dev",
     "deploy": "npx wrangler deploy",
     "db:init": "npx wrangler d1 execute hearth-dash-db --file schema.sql",
@@ -22,20 +23,25 @@
     "personal"
   ],
   "author": "AIDHD",
-  "license": "MIT",
+  "license": "SEE LICENSE IN LICENSE",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/martusha89/hearth-dash.git"
   },
   "engines": {
-    "node": ">=18"
+    "node": ">=22"
   },
   "files": [
     "worker.js",
+    "oauth-entry.js",
     "schema.sql",
     "wrangler.toml",
     "cli/",
     "README.md",
     "LICENSE"
-  ]
+  ],
+  "dependencies": {
+    "@cloudflare/workers-oauth-provider": "0.10.3",
+    "wrangler": "4.135.0"
+  }
 }
