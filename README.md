@@ -112,6 +112,10 @@ Existing deployments must:
 
 The first-visit password setup page has also been removed. A public, unclaimed setup page allowed the first visitor—not necessarily the owner—to take control of a new deployment. Configure `DASHBOARD_PASSWORD` as a Worker secret instead.
 
+### 1.1.1 dashboard-login fix
+
+Version 1.1.1 keeps ordinary dashboard, login and API requests outside the OAuth provider and makes same-origin form validation resilient when a trusted Cloudflare wrapper reconstructs the internal request URL. Cross-site browser submissions remain rejected. Upgrade with `npx hearth-dash@latest deploy` if a 1.1.0 deployment returns plain `Forbidden` after submitting `/login`.
+
 ## Security notes
 
 - There are no functional default credentials, bearer tokens or secret-bearing connector URLs.

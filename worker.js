@@ -84,9 +84,30 @@ function sessionCookie(value, maxAge = 604800) {
   return `__Host-hearth_session=${value}; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=${maxAge}`;
 }
 
-function sameOrigin(request) {
+export function sameOrigin(request) {
   const origin = request.headers.get('Origin');
-  return !origin || origin === new URL(request.url).origin;
+  if (!origin) return true;
+  let parsedOrigin;
+  try { parsedOrigin = new URL(origin); } catch { return false; }
+  if (parsedOrigin.origin === new URL(request.url).origin) return true;
+
+  // Host and Fetch Metadata describe the browser-facing request even if a
+  // trusted Worker wrapper has reconstructed request.url with an internal
+  // origin. Browsers do not let cross-origin pages forge either value.
+  const host = request.headers.get('Host');
+  if (host && parsedOrigin.host === host) return true;
+  return request.headers.get('Sec-Fetch-Site') === 'same-origin';
+}
+
+export function isOAuthRoute(pathname) {
+  return pathname === '/mcp'
+    || pathname.startsWith('/mcp/')
+    || pathname === '/authorize'
+    || pathname === '/oauth/token'
+    || pathname === '/oauth/register'
+    || pathname === '/.well-known/oauth-authorization-server'
+    || pathname === '/.well-known/oauth-protected-resource'
+    || pathname.startsWith('/.well-known/oauth-protected-resource/');
 }
 
 export async function withinRateLimit(env, request, scope, limit, windowSeconds) {

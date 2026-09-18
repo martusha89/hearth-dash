@@ -1,6 +1,6 @@
 ﻿import test from 'node:test';
 import assert from 'node:assert/strict';
-import { applicationHandler, oauthApiHandler } from '../worker.js';
+import { applicationHandler, isOAuthRoute, oauthApiHandler } from '../worker.js';
 
 class FakeD1 {
   constructor() { this.counts = new Map(); }
@@ -165,6 +165,43 @@ test('issues a signed secure session rather than storing the password in the coo
   assert.match(cookie, /Secure/);
   assert.match(cookie, /SameSite=Strict/);
   assert.ok(!cookie.includes(testEnv.DASHBOARD_PASSWORD));
+});
+
+test('accepts a same-origin browser login when a trusted wrapper rewrites request.url', async () => {
+  const testEnv = env();
+  const form = new FormData();
+  form.set('password', testEnv.DASHBOARD_PASSWORD);
+  const response = await applicationHandler.fetch(new Request('https://worker-internal.example/login', {
+    method: 'POST',
+    headers: {
+      Origin: 'https://hearth.example',
+      Host: 'hearth.example',
+      'Sec-Fetch-Site': 'same-origin',
+    },
+    body: form,
+  }), testEnv);
+  assert.equal(response.status, 302);
+  assert.match(response.headers.get('Set-Cookie'), /__Host-hearth_session=/);
+});
+
+test('still rejects cross-site dashboard posts', async () => {
+  const form = new FormData();
+  form.set('password', 'wrong password');
+  const response = await applicationHandler.fetch(new Request('https://hearth.example/login', {
+    method: 'POST',
+    headers: { Origin: 'https://evil.example', 'Sec-Fetch-Site': 'cross-site' },
+    body: form,
+  }), env());
+  assert.equal(response.status, 403);
+});
+
+test('routes only MCP and OAuth protocol paths through the OAuth provider', () => {
+  for (const path of ['/mcp', '/mcp/legacy', '/authorize', '/oauth/token', '/oauth/register', '/.well-known/oauth-authorization-server', '/.well-known/oauth-protected-resource/mcp']) {
+    assert.equal(isOAuthRoute(path), true, path);
+  }
+  for (const path of ['/', '/login', '/logout', '/api/dashboard', '/api/food/photo']) {
+    assert.equal(isOAuthRoute(path), false, path);
+  }
 });
 
 test('escapes configured partner names in HTML and inline JavaScript', async () => {

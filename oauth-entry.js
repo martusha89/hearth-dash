@@ -1,5 +1,5 @@
 import { OAuthProvider } from '@cloudflare/workers-oauth-provider';
-import { oauthApiHandler, oauthDefaultHandler, withinRateLimit } from './worker.js';
+import { applicationHandler, isOAuthRoute, oauthApiHandler, oauthDefaultHandler, withinRateLimit } from './worker.js';
 
 const OAUTH_SCOPES = ['hearth:read', 'hearth:write'];
 
@@ -36,6 +36,12 @@ function createOAuthProvider(request, env) {
 
 export default {
   fetch(request, env, ctx) {
+    // Keep ordinary dashboard traffic out of the OAuth provider. Besides being
+    // unnecessary, wrapping /login and /api requests can obscure the browser's
+    // public origin on some Cloudflare routes and make valid CSRF checks fail.
+    if (!isOAuthRoute(new URL(request.url).pathname)) {
+      return applicationHandler.fetch(request, env, ctx);
+    }
     return createOAuthProvider(request, env).fetch(request, env, ctx);
   },
 };
