@@ -272,7 +272,7 @@ test('completes OAuth consent without relying on a browser CSRF cookie', async (
   const authRequest = {
     responseType: 'code',
     clientId: 'test-client',
-    redirectUri: 'https://claude.ai/api/mcp/auth_callback',
+    redirectUri: 'https://jace-elijah-discord-bridge-production.up.railway.app/hearth/callback',
     scope: ['hearth:read'],
     state: 'state-123',
     codeChallenge: 'challenge',
@@ -283,7 +283,7 @@ test('completes OAuth consent without relying on a browser CSRF cookie', async (
   const provider = {
     async parseAuthRequest() { return authRequest; },
     async lookupClient() { return { clientName: 'Claude' }; },
-    async completeAuthorization() { return { redirectTo: 'https://claude.ai/api/mcp/auth_callback?code=ok&state=state-123' }; },
+    async completeAuthorization() { return { redirectTo: 'https://jace-elijah-discord-bridge-production.up.railway.app/hearth/callback?code=ok&state=state-123' }; },
   };
   const testEnv = env({ OAUTH_PROVIDER: provider });
   const authorizeUrl = 'https://hearth.example/authorize?client_id=test-client&state=state-123';
@@ -292,7 +292,9 @@ test('completes OAuth consent without relying on a browser CSRF cookie', async (
   assert.equal(page.status, 200);
   assert.equal(page.headers.get('Set-Cookie'), null);
   assert.match(page.headers.get('Content-Security-Policy'), /frame-ancestors 'none'/);
-  assert.match(page.headers.get('Content-Security-Policy'), /form-action 'self'/);
+  assert.match(page.headers.get('Content-Security-Policy'), /form-action 'self' https:\/\/jace-elijah-discord-bridge-production\.up\.railway\.app/);
+  assert.doesNotMatch(page.headers.get('Content-Security-Policy'), /\/hearth\/callback/);
+  assert.doesNotMatch(page.headers.get('Content-Security-Policy'), /evil\.example/);
   assert.equal(page.headers.get('X-Frame-Options'), 'DENY');
   assert.equal(page.headers.get('Referrer-Policy'), 'no-referrer');
   assert.equal(page.headers.get('Cache-Control'), 'no-store');
@@ -323,6 +325,26 @@ test('completes OAuth consent without relying on a browser CSRF cookie', async (
   }), testEnv, executionContext());
   assert.equal(replay.status, 400);
   assert.match(await replay.text(), /expired/);
+});
+
+test('rejects non-HTTP callback schemes without widening the global CSP', async () => {
+  const authRequest = {
+    responseType: 'code', clientId: 'native-client', redirectUri: 'com.example.hearth:/oauth/callback',
+    scope: ['hearth:read'], state: 'native-state', codeChallenge: 'challenge', codeChallengeMethod: 'S256',
+    resource: 'https://hearth.example/mcp', issuer: 'https://hearth.example',
+  };
+  const testEnv = env({ OAUTH_PROVIDER: {
+    async parseAuthRequest() { return authRequest; },
+    async lookupClient() { return { clientName: 'Native client' }; },
+  } });
+  const page = await oauthDefaultHandler.fetch(
+    new Request('https://hearth.example/authorize?client_id=native-client&state=native-state'),
+    testEnv, executionContext(),
+  );
+  assert.equal(page.status, 400);
+  assert.match(await page.text(), /Unsupported OAuth callback scheme/);
+  const dashboard = await applicationHandler.fetch(new Request('https://hearth.example/login'), testEnv);
+  assert.equal(dashboard.headers.get('Content-Security-Policy').endsWith("form-action 'self'"), true);
 });
 
 test('binds each one-time consent token to the complete OAuth request', async () => {
@@ -470,6 +492,7 @@ test('rotates a consumed token after a wrong password', async () => {
   const wrong = await post(first, 'wrong');
   assert.equal(wrong.status, 401);
   assert.equal(wrong.headers.get('Cache-Control'), 'no-store');
+  assert.match(wrong.headers.get('Content-Security-Policy'), /form-action 'self' https:\/\/claude\.ai/);
   const second = (await wrong.text()).match(/name="csrf_token" value="([A-Za-z0-9_-]{43})"/)?.[1];
   assert.ok(second && second !== first);
   assert.equal((await post(first, testEnv.DASHBOARD_PASSWORD)).status, 400);
@@ -502,7 +525,9 @@ test('consumes denied consent and rejects unknown decisions', async () => {
     }), testEnv, executionContext());
   };
   const deniedToken = await getToken();
-  assert.equal((await post(deniedToken, 'deny')).status, 302);
+  const denied = await post(deniedToken, 'deny');
+  assert.equal(denied.status, 302);
+  assert.equal(new URL(denied.headers.get('Location')).origin, 'https://claude.ai');
   assert.equal((await post(deniedToken, 'approve')).status, 400);
   assert.equal((await post(await getToken(), 'surprise')).status, 400);
 });
@@ -518,7 +543,7 @@ test('rejects polluted authorization parameters and consent forms', async () => 
     async lookupClient() { return { clientName: 'Claude' }; },
     async completeAuthorization() { return { redirectTo: 'https://claude.ai/api/mcp/auth_callback?code=ok' }; },
   } });
-  const singleton = ['response_type', 'client_id', 'redirect_uri', 'scope', 'state', 'code_challenge', 'code_challenge_method'];
+  const singleton = ['response_type', 'client_id', 'redirect_uri', 'scope', 'state', 'code_challenge', 'code_challenge_method', 'resource'];
   for (const name of singleton) {
     const url = `https://hearth.example/authorize?client_id=test-client&${name}=one&${name}=two`;
     assert.equal((await oauthDefaultHandler.fetch(new Request(url), testEnv, executionContext())).status, 400, name);

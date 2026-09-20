@@ -126,6 +126,10 @@ Version 1.1.2 accepts Chrome's legitimate `Origin: null` on a form submission on
 
 Version 1.1.3 replaces the OAuth consent page's double-submit CSRF cookie with a short-lived, one-time D1 token bound to the complete authorization request and consumed atomically. This avoids browser cookie-context failures during Railway/Claude handoff without weakening same-origin checks or replay protection.
 
+### 1.1.4 OAuth callback CSP fix
+
+Version 1.1.4 gives each authorization page a narrow `form-action` policy containing only Hearth itself and that request's already validated HTTP(S) OAuth callback origin. This allows the browser to follow the successful POST redirect without permitting arbitrary form destinations.
+
 ## Security notes
 
 - There are no functional default credentials, bearer tokens or secret-bearing connector URLs.

@@ -68,9 +68,11 @@ async function verifySession(token, secret) {
   }
 }
 
+const CSP_BASE = "default-src 'self'; img-src 'self' data: https://openweathermap.org; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; base-uri 'none'; frame-ancestors 'none'";
+
 function securityHeaders(extra = {}) {
   return {
-    'Content-Security-Policy': "default-src 'self'; img-src 'self' data: https://openweathermap.org; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'",
+    'Content-Security-Policy': `${CSP_BASE}; form-action 'self'`,
     'Referrer-Policy': 'no-referrer',
     'Strict-Transport-Security': 'max-age=31536000; includeSubDomains',
     'X-Content-Type-Options': 'nosniff',
@@ -78,6 +80,21 @@ function securityHeaders(extra = {}) {
     'Permissions-Policy': 'camera=(), microphone=(), geolocation=()',
     ...extra,
   };
+}
+
+function oauthCallbackCspSource(redirectUri) {
+  const redirect = new URL(redirectUri);
+  if (!['http:', 'https:'].includes(redirect.protocol) || redirect.origin === 'null') {
+    throw new Error('Unsupported OAuth redirect URI scheme');
+  }
+  return redirect.origin;
+}
+
+function oauthConsentHeaders(callbackSource, extra = {}) {
+  return securityHeaders({
+    ...extra,
+    'Content-Security-Policy': `${CSP_BASE}; form-action 'self' ${callbackSource}`,
+  });
 }
 
 function sessionCookie(value, maxAge = 604800) {
@@ -747,7 +764,7 @@ async function consumeOAuthCsrf(env, oauthRequest, token) {
 function validAuthorizationParameterMultiplicity(url) {
   const singleton = [
     'response_type', 'client_id', 'redirect_uri', 'scope', 'state',
-    'code_challenge', 'code_challenge_method',
+    'code_challenge', 'code_challenge_method', 'resource',
   ];
   return singleton.every(name => url.searchParams.getAll(name).length <= 1);
 }
@@ -805,6 +822,12 @@ export const oauthDefaultHandler = {
     }
     const client = await env.OAUTH_PROVIDER.lookupClient(oauthRequest.clientId);
     if (!client) return new Response('Unknown OAuth client', { status: 400, headers: securityHeaders() });
+    let callbackCspSource;
+    try {
+      callbackCspSource = oauthCallbackCspSource(oauthRequest.redirectUri);
+    } catch {
+      return new Response('Unsupported OAuth callback scheme', { status: 400, headers: securityHeaders({ 'Cache-Control': 'no-store' }) });
+    }
 
     const sessionToken = getCookie(request, '__Host-hearth_session');
     const signedIn = await verifySession(sessionToken, config.SESSION_SECRET);
@@ -819,7 +842,7 @@ export const oauthDefaultHandler = {
       } catch {
         return csrfStorageUnavailable();
       }
-      const headers = new Headers(securityHeaders({ 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' }));
+      const headers = new Headers(oauthConsentHeaders(callbackCspSource, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' }));
       return new Response(renderOAuthConsentPage(request.url, oauthRequest, client, csrf, signedIn), { headers });
     }
 
@@ -861,7 +884,7 @@ export const oauthDefaultHandler = {
       } catch {
         return csrfStorageUnavailable();
       }
-      const headers = new Headers(securityHeaders({ 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' }));
+      const headers = new Headers(oauthConsentHeaders(callbackCspSource, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' }));
       return new Response(renderOAuthConsentPage(request.url, oauthRequest, client, csrf, false, 'Wrong dashboard password'), { status: 401, headers });
     }
 
