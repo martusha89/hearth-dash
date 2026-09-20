@@ -1,9 +1,12 @@
 ﻿import test from 'node:test';
 import assert from 'node:assert/strict';
-import { applicationHandler, isOAuthRoute, oauthApiHandler } from '../worker.js';
+import { applicationHandler, isOAuthRoute, oauthApiHandler, oauthDefaultHandler } from '../worker.js';
 
 class FakeD1 {
-  constructor() { this.counts = new Map(); }
+  constructor() {
+    this.counts = new Map();
+    this.oauthCsrf = new Map();
+  }
 
   prepare(sql) {
     const db = this;
@@ -15,10 +18,25 @@ class FakeD1 {
           const key = this.args[0];
           db.counts.set(key, (db.counts.get(key) || 0) + 1);
         }
+        if (sql.startsWith('DELETE FROM oauth_csrf_tokens WHERE token IN')) {
+          const now = this.args[0];
+          for (const [token, record] of db.oauthCsrf) {
+            if (record.expiresAt <= now) db.oauthCsrf.delete(token);
+          }
+        }
+        if (sql.startsWith('INSERT INTO oauth_csrf_tokens')) {
+          db.oauthCsrf.set(this.args[0], { fingerprint: this.args[1], expiresAt: this.args[2] });
+        }
         return { success: true };
       },
       async first() {
         if (sql.startsWith('SELECT count FROM rate_limits')) return { count: db.counts.get(this.args[0]) || 0 };
+        if (sql.startsWith('DELETE FROM oauth_csrf_tokens WHERE token')) {
+          const record = db.oauthCsrf.get(this.args[0]);
+          if (!record || record.expiresAt <= this.args[1]) return null;
+          db.oauthCsrf.delete(this.args[0]);
+          return { request_fingerprint: record.fingerprint };
+        }
         return null;
       },
       async all() { return { results: [] }; },
@@ -248,6 +266,336 @@ test('routes only MCP and OAuth protocol paths through the OAuth provider', () =
   for (const path of ['/', '/login', '/logout', '/api/dashboard', '/api/food/photo']) {
     assert.equal(isOAuthRoute(path), false, path);
   }
+});
+
+test('completes OAuth consent without relying on a browser CSRF cookie', async () => {
+  const authRequest = {
+    responseType: 'code',
+    clientId: 'test-client',
+    redirectUri: 'https://claude.ai/api/mcp/auth_callback',
+    scope: ['hearth:read'],
+    state: 'state-123',
+    codeChallenge: 'challenge',
+    codeChallengeMethod: 'S256',
+    resource: 'https://hearth.example/mcp',
+    issuer: 'https://hearth.example',
+  };
+  const provider = {
+    async parseAuthRequest() { return authRequest; },
+    async lookupClient() { return { clientName: 'Claude' }; },
+    async completeAuthorization() { return { redirectTo: 'https://claude.ai/api/mcp/auth_callback?code=ok&state=state-123' }; },
+  };
+  const testEnv = env({ OAUTH_PROVIDER: provider });
+  const authorizeUrl = 'https://hearth.example/authorize?client_id=test-client&state=state-123';
+
+  const page = await oauthDefaultHandler.fetch(new Request(authorizeUrl), testEnv, executionContext());
+  assert.equal(page.status, 200);
+  assert.equal(page.headers.get('Set-Cookie'), null);
+  assert.match(page.headers.get('Content-Security-Policy'), /frame-ancestors 'none'/);
+  assert.match(page.headers.get('Content-Security-Policy'), /form-action 'self'/);
+  assert.equal(page.headers.get('X-Frame-Options'), 'DENY');
+  assert.equal(page.headers.get('Referrer-Policy'), 'no-referrer');
+  assert.equal(page.headers.get('Cache-Control'), 'no-store');
+  const html = await page.text();
+  const csrf = html.match(/name="csrf_token" value="([A-Za-z0-9_-]{43})"/)?.[1];
+  assert.ok(csrf);
+
+  const form = new FormData();
+  form.set('csrf_token', csrf);
+  form.set('password', testEnv.DASHBOARD_PASSWORD);
+  form.set('decision', 'approve');
+  const approved = await oauthDefaultHandler.fetch(new Request(authorizeUrl, {
+    method: 'POST',
+    headers: { Origin: 'https://hearth.example', 'Sec-Fetch-Site': 'same-origin' },
+    body: form,
+  }), testEnv, executionContext());
+  assert.equal(approved.status, 302);
+  assert.match(approved.headers.get('Location'), /code=ok/);
+
+  const replayForm = new FormData();
+  replayForm.set('csrf_token', csrf);
+  replayForm.set('password', testEnv.DASHBOARD_PASSWORD);
+  replayForm.set('decision', 'approve');
+  const replay = await oauthDefaultHandler.fetch(new Request(authorizeUrl, {
+    method: 'POST',
+    headers: { Origin: 'https://hearth.example', 'Sec-Fetch-Site': 'same-origin' },
+    body: replayForm,
+  }), testEnv, executionContext());
+  assert.equal(replay.status, 400);
+  assert.match(await replay.text(), /expired/);
+});
+
+test('binds each one-time consent token to the complete OAuth request', async () => {
+  const original = {
+    responseType: 'code',
+    clientId: 'test-client',
+    redirectUri: 'https://claude.ai/api/mcp/auth_callback',
+    scope: ['hearth:read'],
+    state: 'state-123',
+    codeChallenge: 'challenge',
+    codeChallengeMethod: 'S256',
+    resource: 'https://hearth.example/mcp',
+    issuer: 'https://hearth.example',
+  };
+  let current = original;
+  const testEnv = env({
+    OAUTH_PROVIDER: {
+      async parseAuthRequest() { return current; },
+      async lookupClient() { return { clientName: 'Claude' }; },
+      async completeAuthorization() { throw new Error('mismatched request must not complete'); },
+    },
+  });
+  const authorizeUrl = 'https://hearth.example/authorize?client_id=test-client&state=state-123';
+  const mutations = [
+    { responseType: 'token' },
+    { clientId: 'other-client' },
+    { redirectUri: 'https://evil.example/callback' },
+    { scope: ['hearth:write'] },
+    { state: 'other-state' },
+    { codeChallenge: 'other-challenge' },
+    { codeChallengeMethod: 'plain' },
+    { resource: 'https://other.example/mcp' },
+    { issuer: 'https://other.example' },
+  ];
+
+  for (const mutation of mutations) {
+    current = original;
+    const page = await oauthDefaultHandler.fetch(new Request(authorizeUrl), testEnv, executionContext());
+    const csrf = (await page.text()).match(/name="csrf_token" value="([A-Za-z0-9_-]{43})"/)?.[1];
+    assert.ok(csrf);
+    current = { ...original, ...mutation };
+    const form = new FormData();
+    form.set('csrf_token', csrf);
+    form.set('password', testEnv.DASHBOARD_PASSWORD);
+    form.set('decision', 'approve');
+    const response = await oauthDefaultHandler.fetch(new Request(authorizeUrl, {
+      method: 'POST',
+      headers: { Origin: 'https://hearth.example', 'Sec-Fetch-Site': 'same-origin' },
+      body: form,
+    }), testEnv, executionContext());
+    assert.equal(response.status, 400, JSON.stringify(mutation));
+  }
+});
+
+test('allows exactly one of two concurrent consent submissions', async () => {
+  const authRequest = {
+    responseType: 'code', clientId: 'test-client', redirectUri: 'https://claude.ai/api/mcp/auth_callback',
+    scope: ['hearth:read'], state: 'concurrent', codeChallenge: 'challenge', codeChallengeMethod: 'S256',
+    resource: 'https://hearth.example/mcp', issuer: 'https://hearth.example',
+  };
+  let completions = 0;
+  const testEnv = env({
+    OAUTH_PROVIDER: {
+      async parseAuthRequest() { return authRequest; },
+      async lookupClient() { return { clientName: 'Claude' }; },
+      async completeAuthorization() {
+        completions += 1;
+        return { redirectTo: 'https://claude.ai/api/mcp/auth_callback?code=ok' };
+      },
+    },
+  });
+  const url = 'https://hearth.example/authorize?client_id=test-client&state=concurrent';
+  const page = await oauthDefaultHandler.fetch(new Request(url), testEnv, executionContext());
+  const csrf = (await page.text()).match(/name="csrf_token" value="([A-Za-z0-9_-]{43})"/)?.[1];
+  const submit = () => {
+    const form = new FormData();
+    form.set('csrf_token', csrf);
+    form.set('password', testEnv.DASHBOARD_PASSWORD);
+    form.set('decision', 'approve');
+    return oauthDefaultHandler.fetch(new Request(url, {
+      method: 'POST', headers: { Origin: 'https://hearth.example', 'Sec-Fetch-Site': 'same-origin' }, body: form,
+    }), testEnv, executionContext());
+  };
+  const responses = await Promise.all([submit(), submit()]);
+  assert.deepEqual(responses.map(response => response.status).sort(), [302, 400]);
+  assert.equal(completions, 1);
+});
+
+test('enforces consent token expiry before at and after the boundary', async () => {
+  const authRequest = {
+    responseType: 'code', clientId: 'test-client', redirectUri: 'https://claude.ai/api/mcp/auth_callback',
+    scope: ['hearth:read'], state: 'expiry', codeChallenge: 'challenge', codeChallengeMethod: 'S256',
+    resource: 'https://hearth.example/mcp', issuer: 'https://hearth.example',
+  };
+  const makeEnv = () => env({
+    OAUTH_PROVIDER: {
+      async parseAuthRequest() { return authRequest; },
+      async lookupClient() { return { clientName: 'Claude' }; },
+      async completeAuthorization() { return { redirectTo: 'https://claude.ai/api/mcp/auth_callback?code=ok' }; },
+    },
+  });
+  const url = 'https://hearth.example/authorize?client_id=test-client&state=expiry';
+  const runAt = async expiresAt => {
+    const testEnv = makeEnv();
+    const page = await oauthDefaultHandler.fetch(new Request(url), testEnv, executionContext());
+    const csrf = (await page.text()).match(/name="csrf_token" value="([A-Za-z0-9_-]{43})"/)?.[1];
+    testEnv.DB.oauthCsrf.get(csrf).expiresAt = expiresAt;
+    const form = new FormData();
+    form.set('csrf_token', csrf);
+    form.set('password', testEnv.DASHBOARD_PASSWORD);
+    form.set('decision', 'approve');
+    return oauthDefaultHandler.fetch(new Request(url, {
+      method: 'POST', headers: { Origin: 'https://hearth.example', 'Sec-Fetch-Site': 'same-origin' }, body: form,
+    }), testEnv, executionContext());
+  };
+  const now = Math.floor(Date.now() / 1000);
+  assert.equal((await runAt(now - 1)).status, 400);
+  assert.equal((await runAt(now)).status, 400);
+  assert.equal((await runAt(now + 2)).status, 302);
+});
+
+test('rotates a consumed token after a wrong password', async () => {
+  const authRequest = {
+    responseType: 'code', clientId: 'test-client', redirectUri: 'https://claude.ai/api/mcp/auth_callback',
+    scope: ['hearth:read'], state: 'retry', codeChallenge: 'challenge', codeChallengeMethod: 'S256',
+    resource: 'https://hearth.example/mcp', issuer: 'https://hearth.example',
+  };
+  const testEnv = env({ OAUTH_PROVIDER: {
+    async parseAuthRequest() { return authRequest; },
+    async lookupClient() { return { clientName: 'Claude' }; },
+    async completeAuthorization() { return { redirectTo: 'https://claude.ai/api/mcp/auth_callback?code=ok' }; },
+  } });
+  const url = 'https://hearth.example/authorize?client_id=test-client&state=retry';
+  const page = await oauthDefaultHandler.fetch(new Request(url), testEnv, executionContext());
+  const first = (await page.text()).match(/name="csrf_token" value="([A-Za-z0-9_-]{43})"/)?.[1];
+  const post = async (token, password, decision = 'approve') => {
+    const form = new FormData();
+    form.set('csrf_token', token);
+    form.set('password', password);
+    form.set('decision', decision);
+    return oauthDefaultHandler.fetch(new Request(url, {
+      method: 'POST', headers: { Origin: 'https://hearth.example', 'Sec-Fetch-Site': 'same-origin' }, body: form,
+    }), testEnv, executionContext());
+  };
+  const wrong = await post(first, 'wrong');
+  assert.equal(wrong.status, 401);
+  assert.equal(wrong.headers.get('Cache-Control'), 'no-store');
+  const second = (await wrong.text()).match(/name="csrf_token" value="([A-Za-z0-9_-]{43})"/)?.[1];
+  assert.ok(second && second !== first);
+  assert.equal((await post(first, testEnv.DASHBOARD_PASSWORD)).status, 400);
+  assert.equal((await post(second, testEnv.DASHBOARD_PASSWORD)).status, 302);
+});
+
+test('consumes denied consent and rejects unknown decisions', async () => {
+  const authRequest = {
+    responseType: 'code', clientId: 'test-client', redirectUri: 'https://claude.ai/api/mcp/auth_callback',
+    scope: ['hearth:read'], state: 'deny', codeChallenge: 'challenge', codeChallengeMethod: 'S256',
+    resource: 'https://hearth.example/mcp', issuer: 'https://hearth.example',
+  };
+  const testEnv = env({ OAUTH_PROVIDER: {
+    async parseAuthRequest() { return authRequest; },
+    async lookupClient() { return { clientName: 'Claude' }; },
+    async completeAuthorization() { throw new Error('denied request must not complete'); },
+  } });
+  const url = 'https://hearth.example/authorize?client_id=test-client&state=deny';
+  const getToken = async () => {
+    const page = await oauthDefaultHandler.fetch(new Request(url), testEnv, executionContext());
+    return (await page.text()).match(/name="csrf_token" value="([A-Za-z0-9_-]{43})"/)?.[1];
+  };
+  const post = async (token, decision) => {
+    const form = new FormData();
+    form.set('csrf_token', token);
+    form.set('password', testEnv.DASHBOARD_PASSWORD);
+    form.set('decision', decision);
+    return oauthDefaultHandler.fetch(new Request(url, {
+      method: 'POST', headers: { Origin: 'https://hearth.example', 'Sec-Fetch-Site': 'same-origin' }, body: form,
+    }), testEnv, executionContext());
+  };
+  const deniedToken = await getToken();
+  assert.equal((await post(deniedToken, 'deny')).status, 302);
+  assert.equal((await post(deniedToken, 'approve')).status, 400);
+  assert.equal((await post(await getToken(), 'surprise')).status, 400);
+});
+
+test('rejects polluted authorization parameters and consent forms', async () => {
+  const authRequest = {
+    responseType: 'code', clientId: 'test-client', redirectUri: 'https://claude.ai/api/mcp/auth_callback',
+    scope: ['hearth:read'], state: 'clean', codeChallenge: 'challenge', codeChallengeMethod: 'S256',
+    resource: ['https://hearth.example/mcp'], issuer: 'https://hearth.example',
+  };
+  const testEnv = env({ OAUTH_PROVIDER: {
+    async parseAuthRequest() { return authRequest; },
+    async lookupClient() { return { clientName: 'Claude' }; },
+    async completeAuthorization() { return { redirectTo: 'https://claude.ai/api/mcp/auth_callback?code=ok' }; },
+  } });
+  const singleton = ['response_type', 'client_id', 'redirect_uri', 'scope', 'state', 'code_challenge', 'code_challenge_method'];
+  for (const name of singleton) {
+    const url = `https://hearth.example/authorize?client_id=test-client&${name}=one&${name}=two`;
+    assert.equal((await oauthDefaultHandler.fetch(new Request(url), testEnv, executionContext())).status, 400, name);
+  }
+
+  const cleanUrl = 'https://hearth.example/authorize?client_id=test-client&state=clean';
+  const page = await oauthDefaultHandler.fetch(new Request(cleanUrl), testEnv, executionContext());
+  const csrf = (await page.text()).match(/name="csrf_token" value="([A-Za-z0-9_-]{43})"/)?.[1];
+  const polluted = new FormData();
+  polluted.set('csrf_token', csrf);
+  polluted.set('password', testEnv.DASHBOARD_PASSWORD);
+  polluted.set('decision', 'approve');
+  polluted.set('state', 'body-conflict');
+  const rejected = await oauthDefaultHandler.fetch(new Request(cleanUrl, {
+    method: 'POST', headers: { Origin: 'https://hearth.example', 'Sec-Fetch-Site': 'same-origin' }, body: polluted,
+  }), testEnv, executionContext());
+  assert.equal(rejected.status, 400);
+});
+
+test('rejects malformed consent tokens and fails closed on D1 errors', async () => {
+  const authRequest = {
+    responseType: 'code', clientId: 'test-client', redirectUri: 'https://claude.ai/api/mcp/auth_callback',
+    scope: ['hearth:read'], state: 'storage', codeChallenge: 'challenge', codeChallengeMethod: 'S256',
+    resource: 'https://hearth.example/mcp', issuer: 'https://hearth.example',
+  };
+  const provider = {
+    async parseAuthRequest() { return authRequest; },
+    async lookupClient() { return { clientName: 'Claude' }; },
+    async completeAuthorization() { throw new Error('invalid token must not complete'); },
+  };
+  const testEnv = env({ OAUTH_PROVIDER: provider });
+  const url = 'https://hearth.example/authorize?client_id=test-client&state=storage';
+  for (const token of ['', 'short', 'A'.repeat(42), 'A'.repeat(44), `${'A'.repeat(42)}=`, `${'A'.repeat(42)}!`]) {
+    const form = new FormData();
+    form.set('csrf_token', token);
+    form.set('password', testEnv.DASHBOARD_PASSWORD);
+    form.set('decision', 'approve');
+    const response = await oauthDefaultHandler.fetch(new Request(url, {
+      method: 'POST', headers: { Origin: 'https://hearth.example', 'Sec-Fetch-Site': 'same-origin' }, body: form,
+    }), testEnv, executionContext());
+    assert.equal(response.status, 400, token);
+  }
+
+  const brokenDb = { prepare() { throw new Error('D1 unavailable'); } };
+  const unavailableGet = await oauthDefaultHandler.fetch(new Request(url), env({ OAUTH_PROVIDER: provider, DB: brokenDb }), executionContext());
+  assert.equal(unavailableGet.status, 429); // rate limiting itself fails closed before token issuance
+
+  const workingEnv = env({ OAUTH_PROVIDER: provider });
+  const page = await oauthDefaultHandler.fetch(new Request(url), workingEnv, executionContext());
+  const csrf = (await page.text()).match(/name="csrf_token" value="([A-Za-z0-9_-]{43})"/)?.[1];
+  workingEnv.DB = brokenDb;
+  const form = new FormData();
+  form.set('csrf_token', csrf);
+  form.set('password', workingEnv.DASHBOARD_PASSWORD);
+  form.set('decision', 'approve');
+  const unavailablePost = await oauthDefaultHandler.fetch(new Request(url, {
+    method: 'POST', headers: { Origin: 'https://hearth.example', 'Sec-Fetch-Site': 'same-origin' }, body: form,
+  }), workingEnv, executionContext());
+  assert.equal(unavailablePost.status, 429); // consent rate limiting also fails closed first
+});
+
+test('rate-limits authorization-page token creation', async () => {
+  const authRequest = {
+    responseType: 'code', clientId: 'test-client', redirectUri: 'https://claude.ai/api/mcp/auth_callback',
+    scope: ['hearth:read'], state: 'rate', codeChallenge: 'challenge', codeChallengeMethod: 'S256',
+    resource: 'https://hearth.example/mcp', issuer: 'https://hearth.example',
+  };
+  const testEnv = env({ OAUTH_PROVIDER: {
+    async parseAuthRequest() { return authRequest; },
+    async lookupClient() { return { clientName: 'Claude' }; },
+  } });
+  const url = 'https://hearth.example/authorize?client_id=test-client&state=rate';
+  for (let index = 0; index < 30; index += 1) {
+    assert.equal((await oauthDefaultHandler.fetch(new Request(url), testEnv, executionContext())).status, 200);
+  }
+  assert.equal((await oauthDefaultHandler.fetch(new Request(url), testEnv, executionContext())).status, 429);
+  assert.equal(testEnv.DB.oauthCsrf.size, 30);
 });
 
 test('escapes configured partner names in HTML and inline JavaScript', async () => {

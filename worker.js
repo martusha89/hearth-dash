@@ -706,7 +706,68 @@ export const applicationHandler = {
 };
 
 const OAUTH_SCOPES = ['hearth:read', 'hearth:write'];
-const OAUTH_CSRF_COOKIE = '__Host-hearth_oauth_csrf';
+const OAUTH_CSRF_TTL = 600;
+
+function oauthRequestFingerprint(oauthRequest) {
+  return JSON.stringify({
+    version: 1,
+    responseType: oauthRequest.responseType,
+    clientId: oauthRequest.clientId,
+    redirectUri: oauthRequest.redirectUri,
+    scope: oauthRequest.scope || [],
+    state: oauthRequest.state,
+    codeChallenge: oauthRequest.codeChallenge || null,
+    codeChallengeMethod: oauthRequest.codeChallengeMethod || null,
+    resource: oauthRequest.resource || null,
+    issuer: oauthRequest.issuer || null,
+  });
+}
+
+async function issueOAuthCsrf(env, oauthRequest) {
+  const token = base64Url(crypto.getRandomValues(new Uint8Array(32)));
+  const now = Math.floor(Date.now() / 1000);
+  await env.DB.prepare(
+    'DELETE FROM oauth_csrf_tokens WHERE token IN (SELECT token FROM oauth_csrf_tokens WHERE expires_at <= ? LIMIT 100)',
+  ).bind(now).run();
+  await env.DB.prepare('INSERT INTO oauth_csrf_tokens (token, request_fingerprint, expires_at) VALUES (?, ?, ?)')
+    .bind(token, oauthRequestFingerprint(oauthRequest), now + OAUTH_CSRF_TTL).run();
+  return token;
+}
+
+async function consumeOAuthCsrf(env, oauthRequest, token) {
+  if (typeof token !== 'string' || !/^[A-Za-z0-9_-]{43}$/.test(token)) return false;
+  const now = Math.floor(Date.now() / 1000);
+  const consumed = await env.DB.prepare(
+    'DELETE FROM oauth_csrf_tokens WHERE token = ? AND expires_at > ? RETURNING request_fingerprint',
+  ).bind(token, now).first();
+  return Boolean(consumed?.request_fingerprint)
+    && safeEqual(consumed.request_fingerprint, oauthRequestFingerprint(oauthRequest));
+}
+
+function validAuthorizationParameterMultiplicity(url) {
+  const singleton = [
+    'response_type', 'client_id', 'redirect_uri', 'scope', 'state',
+    'code_challenge', 'code_challenge_method',
+  ];
+  return singleton.every(name => url.searchParams.getAll(name).length <= 1);
+}
+
+function validConsentFormShape(form) {
+  const allowed = new Set(['csrf_token', 'password', 'decision']);
+  for (const name of form.keys()) {
+    if (!allowed.has(name)) return false;
+  }
+  return form.getAll('csrf_token').length === 1
+    && form.getAll('decision').length === 1
+    && form.getAll('password').length <= 1;
+}
+
+function csrfStorageUnavailable() {
+  return new Response('Authorization storage is temporarily unavailable. Try again.', {
+    status: 503,
+    headers: securityHeaders({ 'Cache-Control': 'no-store', 'Retry-After': '30' }),
+  });
+}
 
 export const oauthApiHandler = {
   async fetch(request, env, ctx) {
@@ -723,6 +784,10 @@ export const oauthDefaultHandler = {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
     if (url.pathname !== '/authorize') return applicationHandler.fetch(request, env, ctx);
+
+    if (!validAuthorizationParameterMultiplicity(url)) {
+      return new Response('Invalid authorization request', { status: 400, headers: securityHeaders({ 'Cache-Control': 'no-store' }) });
+    }
 
     const config = getConfig(env);
     if (!config.PASSWORD || !config.SESSION_SECRET) {
@@ -745,9 +810,16 @@ export const oauthDefaultHandler = {
     const signedIn = await verifySession(sessionToken, config.SESSION_SECRET);
 
     if (request.method === 'GET') {
-      const csrf = base64Url(crypto.getRandomValues(new Uint8Array(32)));
+      if (!(await withinRateLimit(env, request, 'oauth-consent-page', 30, 600))) {
+        return new Response('Too many authorization attempts. Try again later.', { status: 429, headers: securityHeaders({ 'Cache-Control': 'no-store', 'Retry-After': '600' }) });
+      }
+      let csrf;
+      try {
+        csrf = await issueOAuthCsrf(env, oauthRequest);
+      } catch {
+        return csrfStorageUnavailable();
+      }
       const headers = new Headers(securityHeaders({ 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' }));
-      headers.append('Set-Cookie', `${OAUTH_CSRF_COOKIE}=${csrf}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=600`);
       return new Response(renderOAuthConsentPage(request.url, oauthRequest, client, csrf, signedIn), { headers });
     }
 
@@ -758,11 +830,23 @@ export const oauthDefaultHandler = {
     }
 
     const form = await request.formData();
-    const csrfCookie = getCookie(request, OAUTH_CSRF_COOKIE);
-    if (!csrfCookie || !(await safeEqual(csrfCookie, form.get('csrf_token')))) {
+    if (!validConsentFormShape(form)) {
+      return new Response('Invalid authorization form', { status: 400, headers: securityHeaders({ 'Cache-Control': 'no-store' }) });
+    }
+    let validCsrf;
+    try {
+      validCsrf = await consumeOAuthCsrf(env, oauthRequest, form.get('csrf_token'));
+    } catch {
+      return csrfStorageUnavailable();
+    }
+    if (!validCsrf) {
       return new Response('Authorization form expired. Start the connection again.', { status: 400, headers: securityHeaders() });
     }
-    if (form.get('decision') === 'deny') return redirectOAuthDenial(oauthRequest);
+    const decision = form.get('decision');
+    if (decision === 'deny') return redirectOAuthDenial(oauthRequest);
+    if (decision !== 'approve') {
+      return new Response('Invalid authorization decision', { status: 400, headers: securityHeaders({ 'Cache-Control': 'no-store' }) });
+    }
 
     let authenticated = signedIn;
     let newSession = null;
@@ -771,9 +855,13 @@ export const oauthDefaultHandler = {
       if (authenticated) newSession = await createSession(config.SESSION_SECRET);
     }
     if (!authenticated) {
-      const csrf = base64Url(crypto.getRandomValues(new Uint8Array(32)));
+      let csrf;
+      try {
+        csrf = await issueOAuthCsrf(env, oauthRequest);
+      } catch {
+        return csrfStorageUnavailable();
+      }
       const headers = new Headers(securityHeaders({ 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' }));
-      headers.append('Set-Cookie', `${OAUTH_CSRF_COOKIE}=${csrf}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=600`);
       return new Response(renderOAuthConsentPage(request.url, oauthRequest, client, csrf, false, 'Wrong dashboard password'), { status: 401, headers });
     }
 
@@ -788,7 +876,9 @@ export const oauthDefaultHandler = {
     });
 
     const headers = new Headers(securityHeaders({ Location: redirectTo, 'Cache-Control': 'no-store' }));
-    headers.append('Set-Cookie', `${OAUTH_CSRF_COOKIE}=; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=0`);
+    // Remove the cookie used by 1.1.x. Authorization CSRF state is now a
+    // short-lived, one-time server-side record and does not depend on cookies.
+    headers.append('Set-Cookie', '__Host-hearth_oauth_csrf=; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=0');
     if (newSession) headers.append('Set-Cookie', sessionCookie(newSession));
     return new Response(null, { status: 302, headers });
   },

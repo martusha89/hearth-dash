@@ -93,3 +93,12 @@ CREATE TABLE IF NOT EXISTS rate_limits (
   expires_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_rate_limits_expires ON rate_limits(expires_at);
+
+-- Short-lived, single-use OAuth authorization transactions. D1 provides an
+-- atomic DELETE ... RETURNING consume step so consent forms cannot be replayed.
+CREATE TABLE IF NOT EXISTS oauth_csrf_tokens (
+  token TEXT PRIMARY KEY,
+  request_fingerprint TEXT NOT NULL,
+  expires_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_oauth_csrf_expires ON oauth_csrf_tokens(expires_at);

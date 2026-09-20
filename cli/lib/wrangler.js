@@ -79,6 +79,56 @@ export async function executeSchema(dbName, schemaPath, cwd) {
   return { ok: true };
 }
 
+export function hasRequiredSchemaTables(output, requiredTables) {
+  try {
+    const parsed = JSON.parse(output);
+    const envelopes = Array.isArray(parsed) ? parsed : [parsed];
+    const names = new Set(envelopes.flatMap(item => item?.results || []).map(row => row.name));
+    return requiredTables.every(name => names.has(name));
+  } catch {
+    return false;
+  }
+}
+
+export function hasRequiredOAuthCsrfColumns(output) {
+  try {
+    const parsed = JSON.parse(output);
+    const envelopes = Array.isArray(parsed) ? parsed : [parsed];
+    const columns = new Map(envelopes.flatMap(item => item?.results || []).map(row => [row.name, row]));
+    const token = columns.get('token');
+    const fingerprint = columns.get('request_fingerprint');
+    const expires = columns.get('expires_at');
+    return columns.size === 3
+      && String(token?.type).toUpperCase() === 'TEXT' && Number(token?.pk) === 1
+      && String(fingerprint?.type).toUpperCase() === 'TEXT' && Number(fingerprint?.notnull) === 1
+      && String(expires?.type).toUpperCase() === 'INTEGER' && Number(expires?.notnull) === 1;
+  } catch {
+    return false;
+  }
+}
+
+export async function verifySecuritySchema(dbName, cwd) {
+  const requiredTables = ['rate_limits', 'oauth_csrf_tokens'];
+  const quoted = requiredTables.map(name => `'${name.replaceAll("'", "''")}'`).join(', ');
+  const query = `SELECT name FROM sqlite_master WHERE type = 'table' AND name IN (${quoted}) ORDER BY name;`;
+  const tables = await execWrangler(['d1', 'execute', dbName, '--remote', '--command', query, '--json'], cwd);
+  if (tables.code !== 0 || !hasRequiredSchemaTables(tables.stdout, requiredTables)) return false;
+  const columns = await execWrangler([
+    'd1', 'execute', dbName, '--remote', '--command', 'PRAGMA table_info(oauth_csrf_tokens);', '--json',
+  ], cwd);
+  return columns.code === 0 && hasRequiredOAuthCsrfColumns(columns.stdout);
+}
+
+export async function provisionAfterVerifiedSchema({ applySchema, verifySchema, provisionWorker, onSchemaVerified = () => {} }) {
+  const schemaResult = await applySchema();
+  if (!schemaResult.ok) return { ok: false, stage: 'schema', schemaResult };
+  const schemaVerified = await verifySchema();
+  if (!schemaVerified) return { ok: false, stage: 'verification', schemaResult };
+  onSchemaVerified();
+  const provisionResult = await provisionWorker();
+  return { ok: provisionResult.code === 0, stage: 'provision', schemaResult, provisionResult };
+}
+
 export async function listD1Databases(cwd) {
   const result = await execWrangler(["d1", "list", "--json"], cwd);
   if (result.code !== 0) return [];

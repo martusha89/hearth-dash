@@ -5,7 +5,8 @@ import { getPackageRoot, getNodeMajor } from "../lib/platform.js";
 import { ask, confirm, password } from "../lib/prompts.js";
 import {
   execWrangler, execCommand, parseD1CreateOutput, parseDeployOutput, parseKvCreateOutput,
-  checkWranglerAuth, wranglerLogin, setSecret, executeSchema, listD1Databases, listKvNamespaces,
+  checkWranglerAuth, wranglerLogin, setSecret, executeSchema, verifySecuritySchema, provisionAfterVerifiedSchema,
+  listD1Databases, listKvNamespaces,
 } from "../lib/wrangler.js";
 import { banner, step, bold, dim, cyan, green, yellow, red, success, fail, warn, info, spinner } from "../lib/ui.js";
 
@@ -170,11 +171,28 @@ export default async function deployCommand(args) {
 
   step(5, TOTAL_STEPS, "Deploying worker");
 
-  // A Worker must exist before Wrangler can set secrets non-interactively.
-  // This first deployment is inert: application and consent routes return 503
-  // until the required secrets are present.
-  const provision = spinner("Provisioning Cloudflare Worker");
-  const provisionResult = await execWrangler(["deploy"], deployDir);
+  const s6 = spinner("Initializing database schema");
+  let provision;
+  const prepared = await provisionAfterVerifiedSchema({
+    applySchema: () => executeSchema("hearth-dash-db", join(deployDir, "schema.sql"), deployDir),
+    verifySchema: () => verifySecuritySchema('hearth-dash-db', deployDir),
+    onSchemaVerified: () => {
+      s6.stop("Database schema initialized and verified");
+      provision = spinner("Provisioning Cloudflare Worker");
+    },
+    provisionWorker: () => execWrangler(["deploy"], deployDir),
+  });
+  if (prepared.stage === 'schema') {
+    s6.fail("Schema init failed: " + (prepared.schemaResult.error || "unknown error"));
+    console.error("Deployment is incomplete; no success configuration was saved.");
+    process.exit(1);
+  }
+  if (prepared.stage === 'verification') {
+    s6.fail('Schema verification failed: required security tables are missing');
+    console.error('Worker activation was not attempted.');
+    process.exit(1);
+  }
+  const provisionResult = prepared.provisionResult;
   if (provisionResult.code !== 0) {
     provision.fail("Worker provisioning failed");
     console.error(provisionResult.stderr || provisionResult.stdout);
@@ -187,15 +205,6 @@ export default async function deployCommand(args) {
     process.exit(1);
   }
   provision.stop(`Worker provisioned: ${workerUrl}`);
-
-  const s6 = spinner("Initializing database schema");
-  const schemaResult = await executeSchema("hearth-dash-db", join(deployDir, "schema.sql"), deployDir);
-  if (!schemaResult.ok) {
-    s6.fail("Schema init failed: " + (schemaResult.error || "unknown error"));
-    console.error("Deployment is incomplete; no success configuration was saved.");
-    process.exit(1);
-  }
-  s6.stop("Database schema initialized");
 
   const s4 = spinner("Setting secrets");
   const secrets = [

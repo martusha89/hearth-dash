@@ -53,9 +53,11 @@ node -e "console.log(require('node:crypto').randomBytes(32).toString('base64url'
 # Optional weather integration
 # (set WEATHER_API_KEY after provisioning if wanted)
 
-# Provision the Worker first, then initialize storage and set secrets
-npm run deploy
+# Initialize and verify storage before activating the Worker
 npm run db:init:remote
+
+# Provision the Worker, then set secrets
+npm run deploy
 npx wrangler secret put DASHBOARD_PASSWORD
 npx wrangler secret put SESSION_SECRET
 npx wrangler secret put WEATHER_API_KEY  # optional
@@ -120,12 +122,16 @@ Version 1.1.1 keeps ordinary dashboard, login and API requests outside the OAuth
 
 Version 1.1.2 accepts Chrome's legitimate `Origin: null` on a form submission only when the browser's unforgeable Fetch Metadata independently classifies the request as `same-origin`. Mismatched, malformed, same-site and cross-site requests remain rejected.
 
+### 1.1.3 OAuth consent fix
+
+Version 1.1.3 replaces the OAuth consent page's double-submit CSRF cookie with a short-lived, one-time D1 token bound to the complete authorization request and consumed atomically. This avoids browser cookie-context failures during Railway/Claude handoff without weakening same-origin checks or replay protection.
+
 ## Security notes
 
 - There are no functional default credentials, bearer tokens or secret-bearing connector URLs.
 - OAuth uses authorization-code flow, S256 PKCE, RFC 9728 protected-resource metadata, RFC 8414 authorization-server metadata, resource-bound access tokens and refresh-token rotation from Cloudflare's maintained `workers-oauth-provider` library.
 - Access tokens expire after one hour. Rotating refresh tokens have a 30-day TTL. Dynamically registered clients expire after 90 days.
-- Consent requires either a valid signed dashboard session or the dashboard password. Consent POSTs use a short-lived CSRF cookie, same-origin checks and rate limiting.
+- Consent requires either a valid signed dashboard session or the dashboard password. Consent POSTs use a short-lived one-time server-side CSRF token, same-origin checks and rate limiting.
 - `hearth:read` and `hearth:write` are enforced at tool-call time. Read-only tokens cannot invoke write actions hidden inside mixed read/write tools.
 - Session cookies are signed, expire after seven days and use the `__Host-` prefix plus `Secure`, `HttpOnly` and `SameSite=Strict`.
 - Browser origins, JSON body size and tool arguments are validated. MCP, login, consent and dynamic-registration paths are rate-limited.
